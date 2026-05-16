@@ -82,6 +82,80 @@ def main() -> None:
         with lock:
             console.print(f"[bold green]{sender}[/bold green] [white]{plaintext}[/white]")
 
+    def resolve_target(peers: list, target_token: str):
+        # Explicit routing for duplicates: allow `username@port` or `ip:port`.
+        if "@" in target_token:
+            username, port_text = target_token.rsplit("@", 1)
+            if port_text.isdigit():
+                port = int(port_text)
+                return next(
+                    (p for p in peers if p.username == username and p.tcp_port == port),
+                    None,
+                )
+
+        if ":" in target_token:
+            host, port_text = target_token.rsplit(":", 1)
+            if port_text.isdigit():
+                port = int(port_text)
+                return next((p for p in peers if p.ip == host and p.tcp_port == port), None)
+
+        matches = [p for p in peers if p.username == target_token]
+        if len(matches) == 1:
+            return matches[0]
+        return matches
+
+    def interactive_send_message() -> None:
+        peers = discovery.peers()
+        if not peers:
+            with lock:
+                console.print("[yellow]WARN[/yellow] No peers discovered. Try again in a moment.")
+            return
+
+        with lock:
+            console.print("[cyan]Select recipient:[/cyan]")
+            for idx, peer in enumerate(peers, start=1):
+                console.print(f"  {idx}. {peer.username} ({peer.ip}:{peer.tcp_port})")
+
+        selection = input("peer number> ").strip()
+        if not selection.isdigit():
+            with lock:
+                console.print("[yellow]WARN[/yellow] Invalid selection.")
+            return
+
+        index = int(selection) - 1
+        if index < 0 or index >= len(peers):
+            with lock:
+                console.print("[yellow]WARN[/yellow] Selection out of range.")
+            return
+
+        text = input("message> ").strip()
+        if not text:
+            with lock:
+                console.print("[yellow]WARN[/yellow] Message is empty.")
+            return
+
+        target = peers[index]
+        try:
+            recipient_public = parse_public_key_b64(target.enc_public_key_b64)
+            signature = sign_message(keys.sign_private, text)
+            ciphertext = encrypt_message(keys.enc_private, recipient_public, text)
+            packet = {
+                "type": "MESSAGE",
+                "sender": args.username,
+                "sender_enc_public_key": keys.enc_public_b64,
+                "sender_sign_public_key": keys.sign_public_b64,
+                "ciphertext": ciphertext,
+                "signature": signature,
+            }
+            transport.send_packet(target.ip, target.tcp_port, packet)
+            with lock:
+                console.print(
+                    f"[cyan]INFO[/cyan] Encrypted message sent to {target.username} ({target.ip}:{target.tcp_port})"
+                )
+        except OSError as exc:
+            with lock:
+                console.print(f"[yellow]WARN[/yellow] Send failed: {exc}")
+
     discovery = DiscoveryService(
         peer_id=peer_id,
         username=args.username,
@@ -111,13 +185,26 @@ def main() -> None:
                 with lock:
                     console.print(f"[cyan]INFO[/cyan] {len(peers)} peer(s) discovered")
                     console.print(ui.peers_panel(peers))
+                    duplicate_usernames = {
+                        p.username for p in peers if sum(1 for q in peers if q.username == p.username) > 1
+                    }
+                    if duplicate_usernames:
+                        console.print(
+                            "[yellow]WARN[/yellow] Duplicate usernames detected. "
+                            "Use '/msg <username>@<port> <text>' to target a specific peer."
+                        )
                 continue
 
             if line == "/help":
                 with lock:
                     console.print("[cyan]INFO[/cyan] /peers: show discovered peers")
                     console.print("[cyan]INFO[/cyan] /msg <username> <text>: send encrypted message")
+                    console.print("[cyan]INFO[/cyan] /msg: interactive recipient picker")
                     console.print("[cyan]INFO[/cyan] /quit: exit")
+                continue
+
+            if line == "/msg":
+                interactive_send_message()
                 continue
 
             if line.startswith("/msg "):
@@ -128,22 +215,24 @@ def main() -> None:
                     continue
                 target_username, text = parts[1], parts[2]
                 peers = discovery.peers()
-                matches = [p for p in peers if p.username == target_username]
-                if not matches:
+                resolved = resolve_target(peers, target_username)
+                if resolved is None:
                     with lock:
                         console.print(
                             f"[yellow]WARN[/yellow] Peer '{target_username}' not found. Try /peers"
                         )
                     continue
-                if len(matches) > 1:
-                    options = ", ".join(f"{p.ip}:{p.tcp_port}" for p in matches)
+                if isinstance(resolved, list):
+                    options = ", ".join(
+                        f"{p.username}@{p.tcp_port} ({p.ip}:{p.tcp_port})" for p in resolved
+                    )
                     with lock:
                         console.print(
                             f"[yellow]WARN[/yellow] Multiple peers named '{target_username}': {options}. "
-                            "Use unique usernames per node."
+                            "Use '/msg <username>@<port> <text>' or use the interactive picker by typing '/msg'."
                         )
                     continue
-                target = matches[0]
+                target = resolved
                 try:
                     recipient_public = parse_public_key_b64(target.enc_public_key_b64)
                     signature = sign_message(keys.sign_private, text)
