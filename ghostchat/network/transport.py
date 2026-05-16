@@ -2,7 +2,7 @@ import json
 import socket
 import threading
 import uuid
-from typing import Callable, Dict, Set, Optional
+from typing import Callable, Dict, Set, Optional, Tuple
 
 
 MessageHandler = Callable[[dict], None]
@@ -17,10 +17,12 @@ class TransportService:
 
         # peer_id -> socket
         self.peers: Dict[str, socket.socket] = {}
+        # peer_id -> Lock (per-peer write lock)
+        self.write_locks: Dict[str, threading.Lock] = {}
         self.peers_lock = threading.Lock()
 
-        # message_id -> Event (set when ACK received)
-        self.pending_acks: Dict[str, threading.Event] = {}
+        # (peer_id, message_id) -> Event (set when ACK received)
+        self.pending_acks: Dict[Tuple[str, str], threading.Event] = {}
         self.acks_lock = threading.Lock()
 
         # Recently processed message IDs to prevent duplicates
@@ -40,24 +42,27 @@ class TransportService:
                 except OSError:
                     pass
             self.peers.clear()
+            self.write_locks.clear()
 
-    def _get_connection(self, peer_id: str, ip: str, port: int) -> Optional[socket.socket]:
+    def _get_connection(self, peer_id: str, ip: str, port: int) -> Tuple[Optional[socket.socket], Optional[threading.Lock]]:
         with self.peers_lock:
             if peer_id in self.peers:
-                return self.peers[peer_id]
+                return self.peers[peer_id], self.write_locks[peer_id]
 
         try:
             sock = socket.create_connection((ip, port), timeout=3)
             with self.peers_lock:
                 if peer_id in self.peers:
                     sock.close()
-                    return self.peers[peer_id]
+                    return self.peers[peer_id], self.write_locks[peer_id]
                 self.peers[peer_id] = sock
+                lock = threading.Lock()
+                self.write_locks[peer_id] = lock
 
             threading.Thread(target=self._handle_conn, args=(sock, peer_id), daemon=True).start()
-            return sock
+            return sock, lock
         except OSError:
-            return None
+            return None, None
 
     def send_packet(self, peer_id: str, ip: str, port: int, packet: dict, wait_for_ack: bool = False) -> bool:
         if "message_id" not in packet:
@@ -69,29 +74,30 @@ class TransportService:
         if wait_for_ack:
             ack_event = threading.Event()
             with self.acks_lock:
-                self.pending_acks[msg_id] = ack_event
+                self.pending_acks[(peer_id, msg_id)] = ack_event
 
-        sock = self._get_connection(peer_id, ip, port)
-        if not sock:
+        sock, write_lock = self._get_connection(peer_id, ip, port)
+        if not sock or not write_lock:
             if ack_event:
                 with self.acks_lock:
-                    self.pending_acks.pop(msg_id, None)
+                    self.pending_acks.pop((peer_id, msg_id), None)
             return False
 
         data = json.dumps(packet).encode("utf-8") + b"\n"
         try:
-            sock.sendall(data)
+            with write_lock:
+                sock.sendall(data)
         except OSError:
             self._remove_peer(peer_id, sock)
             if ack_event:
                 with self.acks_lock:
-                    self.pending_acks.pop(msg_id, None)
+                    self.pending_acks.pop((peer_id, msg_id), None)
             return False
 
         if wait_for_ack and ack_event:
             success = ack_event.wait(timeout=5.0)
             with self.acks_lock:
-                self.pending_acks.pop(msg_id, None)
+                self.pending_acks.pop((peer_id, msg_id), None)
             return success
 
         return True
@@ -100,6 +106,7 @@ class TransportService:
         with self.peers_lock:
             if self.peers.get(peer_id) == sock:
                 del self.peers[peer_id]
+                del self.write_locks[peer_id]
         try:
             sock.close()
         except OSError:
@@ -143,20 +150,31 @@ class TransportService:
                     if peer_id is None:
                         peer_id = sender_peer_id
                         with self.peers_lock:
-                            if peer_id not in self.peers:
+                            if peer_id in self.peers:
+                                # Connection already exists for this peer, but we got a new incoming one.
+                                # To avoid confusion, we could either reject this or close the old one.
+                                # For now, let's just close this new one if it conflicts.
+                                # Actually, better to just allow it but don't overwrite the primary.
+                                # Or just accept it. The requirement is "maintain active socket connections".
+                                # If we already have one, we might not want to overwrite it.
+                                pass
+                            else:
                                 self.peers[peer_id] = conn
+                                self.write_locks[peer_id] = threading.Lock()
                     elif peer_id != sender_peer_id:
-                        # Peer ID mismatch for this connection, could log it
-                        pass
+                        # Malicious/buggy peer claiming different peer_id
+                        # Ignore this packet and possibly close connection
+                        continue
 
                 msg_type = packet.get("type")
                 msg_id = packet.get("message_id")
 
                 if msg_type == "ACK":
-                    if msg_id:
+                    if msg_id and peer_id:
                         with self.acks_lock:
-                            if msg_id in self.pending_acks:
-                                self.pending_acks[msg_id].set()
+                            key = (peer_id, msg_id)
+                            if key in self.pending_acks:
+                                self.pending_acks[key].set()
                     continue
 
                 if msg_id:
@@ -167,10 +185,11 @@ class TransportService:
                         else:
                             self.processed_msgs.add(msg_id)
                             if len(self.processed_msgs) > 1000:
-                                # Pop oldest (not perfectly LRU but enough)
                                 self.processed_msgs.remove(next(iter(self.processed_msgs)))
 
-                    self._send_ack(conn, msg_id)
+                    if peer_id:
+                        self._send_ack(peer_id, msg_id)
+
                     if is_duplicate:
                         continue
 
@@ -182,9 +201,17 @@ class TransportService:
                 with self.peers_lock:
                     if self.peers.get(peer_id) == conn:
                         del self.peers[peer_id]
+                        del self.write_locks[peer_id]
             conn.close()
 
-    def _send_ack(self, conn: socket.socket, message_id: str) -> None:
+    def _send_ack(self, peer_id: str, message_id: str) -> None:
+        with self.peers_lock:
+            conn = self.peers.get(peer_id)
+            write_lock = self.write_locks.get(peer_id)
+
+        if not conn or not write_lock:
+            return
+
         ack = {
             "type": "ACK",
             "message_id": message_id,
@@ -192,6 +219,7 @@ class TransportService:
         }
         try:
             data = json.dumps(ack).encode("utf-8") + b"\n"
-            conn.sendall(data)
+            with write_lock:
+                conn.sendall(data)
         except OSError:
             pass
