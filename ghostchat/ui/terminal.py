@@ -33,14 +33,6 @@ class TerminalUI:
     def add_message(self, sender: str, text: str) -> None:
         self.events.append(UiEvent(level="msg", message=f"{sender}: {text}"))
 
-    def header_panel(self) -> Panel:
-        header = Text()
-        header.append("GhostChat", style="bold cyan")
-        header.append(f"  user={self.username}")
-        header.append(f"  port={self.port}")
-        header.append(f"  fp={self.fingerprint}", style="green")
-        return Panel(header, title="Session")
-
     def peers_panel(self, peers: Iterable[object]) -> Panel:
         table = Table(show_header=True, header_style="bold magenta")
         table.add_column("Username")
@@ -68,3 +60,9 @@ class TerminalUI:
         if not lines:
             lines.append(Text("No events yet."))
         return Panel(Group(*lines), title="Event Log")
+
+    def dashboard(self, peers: Iterable[object]) -> Group:
+        return Group(
+            self.peers_panel(peers),
+            Text("Commands: /peers, /msg <username> <text>, /help, /quit\n"),
+        )

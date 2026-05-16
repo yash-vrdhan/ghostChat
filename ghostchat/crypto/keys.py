@@ -7,7 +7,7 @@ from nacl.public import PrivateKey, PublicKey
 from nacl.signing import SigningKey, VerifyKey
 
 
-KEY_DIR = Path.home() / ".ghostchat"
+KEY_ROOT_DIR = Path.home() / ".ghostchat"
 ENC_PRIVATE_FILE = "enc_private.key"
 SIGN_PRIVATE_FILE = "sign_private.key"
 
@@ -41,11 +41,15 @@ def _read_private_key(path: Path) -> bytes:
     return base64.b64decode(path.read_text(encoding="utf-8").strip())
 
 
-def load_or_create_keys() -> NodeKeys:
-    KEY_DIR.mkdir(parents=True, exist_ok=True)
+def load_or_create_keys(profile: str = "default") -> NodeKeys:
+    safe_profile = "".join(c for c in profile if c.isalnum() or c in ("-", "_")).strip("_-")
+    if not safe_profile:
+        safe_profile = "default"
+    key_dir = KEY_ROOT_DIR / safe_profile
+    key_dir.mkdir(parents=True, exist_ok=True)
 
-    enc_path = KEY_DIR / ENC_PRIVATE_FILE
-    sign_path = KEY_DIR / SIGN_PRIVATE_FILE
+    enc_path = key_dir / ENC_PRIVATE_FILE
+    sign_path = key_dir / SIGN_PRIVATE_FILE
 
     if enc_path.exists():
         enc_private = PrivateKey(_read_private_key(enc_path), encoder=RawEncoder)

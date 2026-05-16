@@ -1,18 +1,20 @@
 import argparse
 import secrets
 import socket
-import sys
 import threading
-import time
 
 from rich.console import Console
 
-from crypto.encrypt import decrypt_message, encrypt_message
-from crypto.keys import load_or_create_keys, parse_public_key_b64, parse_verify_key_b64
-from crypto.signing import sign_message, verify_signature
-from network.discovery import DiscoveryService
-from network.transport import TransportService
-from ui.terminal import TerminalUI
+from ghostchat.crypto.encrypt import decrypt_message, encrypt_message
+from ghostchat.crypto.keys import (
+    load_or_create_keys,
+    parse_public_key_b64,
+    parse_verify_key_b64,
+)
+from ghostchat.crypto.signing import sign_message, verify_signature
+from ghostchat.network.discovery import DiscoveryService
+from ghostchat.network.transport import TransportService
+from ghostchat.ui.terminal import TerminalUI
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,10 +27,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     peer_id = secrets.token_hex(8)
-    keys = load_or_create_keys()
+    keys = load_or_create_keys(profile=args.username)
     console = Console()
     ui = TerminalUI(username=args.username, fingerprint=keys.fingerprint, port=args.port)
-    lock = threading.Lock()
+    lock = threading.RLock()
 
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -41,13 +43,9 @@ def main() -> None:
     finally:
         probe.close()
 
-    def render_screen() -> None:
+    def render_dashboard() -> None:
         with lock:
-            console.clear()
-            console.print(ui.header_panel())
-            console.print(ui.peers_panel(discovery.peers()))
-            console.print(ui.logs_panel())
-            console.print("Commands: /peers, /msg <username> <text>, /help, /quit")
+            console.print(ui.dashboard(discovery.peers()))
 
     def on_message(packet: dict) -> None:
         if packet.get("type") != "MESSAGE":
@@ -60,8 +58,8 @@ def main() -> None:
         signature = packet.get("signature")
 
         if not all([sender_enc_public_b64, sender_sign_public_b64, ciphertext, signature]):
-            ui.add_warn("Dropped malformed encrypted packet")
-            render_screen()
+            with lock:
+                console.print("[yellow]WARN[/yellow] Dropped malformed encrypted packet")
             return
 
         try:
@@ -70,17 +68,19 @@ def main() -> None:
             sender_verify_key = parse_verify_key_b64(sender_sign_public_b64)
             valid = verify_signature(sender_verify_key, plaintext, signature)
         except Exception as exc:
-            ui.add_warn(f"Failed to decrypt/verify: {exc}")
-            render_screen()
+            with lock:
+                console.print(f"[yellow]WARN[/yellow] Failed to decrypt/verify: {exc}")
             return
 
         if not valid:
-            ui.add_warn(f"Signature verification failed for sender {sender}")
-            render_screen()
+            with lock:
+                console.print(
+                    f"[yellow]WARN[/yellow] Signature verification failed for sender {sender}"
+                )
             return
 
-        ui.add_message(sender, plaintext)
-        render_screen()
+        with lock:
+            console.print(f"[bold green]{sender}[/bold green] [white]{plaintext}[/white]")
 
     discovery = DiscoveryService(
         peer_id=peer_id,
@@ -94,12 +94,13 @@ def main() -> None:
     discovery.start()
     transport.start()
 
-    ui.add_info("GhostChat started")
-    ui.add_info(f"peer_id={peer_id}")
-    ui.add_info("Encryption and signatures enabled")
-    render_screen()
-
     try:
+        with lock:
+            console.print("[cyan]INFO[/cyan] GhostChat started")
+            console.print(f"[cyan]INFO[/cyan] peer_id={peer_id}")
+            console.print("[cyan]INFO[/cyan] Encryption and signatures enabled")
+            render_dashboard()
+
         while True:
             line = input("> ").strip()
             if not line:
@@ -107,30 +108,42 @@ def main() -> None:
 
             if line == "/peers":
                 peers = discovery.peers()
-                ui.add_info(f"{len(peers)} peer(s) discovered")
-                render_screen()
+                with lock:
+                    console.print(f"[cyan]INFO[/cyan] {len(peers)} peer(s) discovered")
+                    console.print(ui.peers_panel(peers))
                 continue
 
             if line == "/help":
-                ui.add_info("/peers: show discovered peers")
-                ui.add_info("/msg <username> <text>: send encrypted message")
-                ui.add_info("/quit: exit")
-                render_screen()
+                with lock:
+                    console.print("[cyan]INFO[/cyan] /peers: show discovered peers")
+                    console.print("[cyan]INFO[/cyan] /msg <username> <text>: send encrypted message")
+                    console.print("[cyan]INFO[/cyan] /quit: exit")
                 continue
 
             if line.startswith("/msg "):
                 parts = line.split(" ", 2)
                 if len(parts) < 3:
-                    ui.add_warn("Usage: /msg <username> <text>")
-                    render_screen()
+                    with lock:
+                        console.print("[yellow]WARN[/yellow] Usage: /msg <username> <text>")
                     continue
                 target_username, text = parts[1], parts[2]
                 peers = discovery.peers()
-                target = next((p for p in peers if p.username == target_username), None)
-                if not target:
-                    ui.add_warn(f"Peer '{target_username}' not found. Try /peers")
-                    render_screen()
+                matches = [p for p in peers if p.username == target_username]
+                if not matches:
+                    with lock:
+                        console.print(
+                            f"[yellow]WARN[/yellow] Peer '{target_username}' not found. Try /peers"
+                        )
                     continue
+                if len(matches) > 1:
+                    options = ", ".join(f"{p.ip}:{p.tcp_port}" for p in matches)
+                    with lock:
+                        console.print(
+                            f"[yellow]WARN[/yellow] Multiple peers named '{target_username}': {options}. "
+                            "Use unique usernames per node."
+                        )
+                    continue
+                target = matches[0]
                 try:
                     recipient_public = parse_public_key_b64(target.enc_public_key_b64)
                     signature = sign_message(keys.sign_private, text)
@@ -144,17 +157,20 @@ def main() -> None:
                         "signature": signature,
                     }
                     transport.send_packet(target.ip, target.tcp_port, packet)
-                    ui.add_info(f"Encrypted message sent to {target_username}")
+                    with lock:
+                        console.print(
+                            f"[cyan]INFO[/cyan] Encrypted message sent to {target_username}"
+                        )
                 except OSError as exc:
-                    ui.add_warn(f"Send failed: {exc}")
-                render_screen()
+                    with lock:
+                        console.print(f"[yellow]WARN[/yellow] Send failed: {exc}")
                 continue
 
             if line == "/quit":
                 break
 
-            ui.add_warn("Unknown command. Try /help")
-            render_screen()
+            with lock:
+                console.print("[yellow]WARN[/yellow] Unknown command. Try /help")
 
     except (KeyboardInterrupt, EOFError):
         pass
