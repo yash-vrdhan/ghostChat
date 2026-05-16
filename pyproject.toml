@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ghostchat"
+version = "0.1.0"
+description = "Distributed end-to-end encrypted terminal messaging (learning project)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "PyNaCl>=1.5.0",
+  "rich>=13.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[project.scripts]
+ghostchat = "ghostchat.main:main"
+
+[tool.setuptools]
+packages = ["ghostchat", "ghostchat.network", "ghostchat.crypto", "ghostchat.ui"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
