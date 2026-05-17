@@ -134,6 +134,10 @@ class TransportService:
 
     def _handle_conn(self, conn: socket.socket, identified_peer_id: Optional[str] = None) -> None:
         peer_id = identified_peer_id
+        local_write_lock: Optional[threading.Lock] = None
+        if identified_peer_id is not None:
+            with self.peers_lock:
+                local_write_lock = self.write_locks.get(identified_peer_id)
         try:
             f = conn.makefile("rb")
             while not self._stop_event.is_set():
@@ -151,16 +155,12 @@ class TransportService:
                         peer_id = sender_peer_id
                         with self.peers_lock:
                             if peer_id in self.peers:
-                                # Connection already exists for this peer, but we got a new incoming one.
-                                # To avoid confusion, we could either reject this or close the old one.
-                                # For now, let's just close this new one if it conflicts.
-                                # Actually, better to just allow it but don't overwrite the primary.
-                                # Or just accept it. The requirement is "maintain active socket connections".
-                                # If we already have one, we might not want to overwrite it.
-                                pass
+                                # Keep canonical mapping stable and use a local lock for this connection.
+                                local_write_lock = self.write_locks[peer_id]
                             else:
                                 self.peers[peer_id] = conn
-                                self.write_locks[peer_id] = threading.Lock()
+                                local_write_lock = threading.Lock()
+                                self.write_locks[peer_id] = local_write_lock
                     elif peer_id != sender_peer_id:
                         # Malicious/buggy peer claiming different peer_id
                         # Ignore this packet and possibly close connection
@@ -188,7 +188,7 @@ class TransportService:
                                 self.processed_msgs.remove(next(iter(self.processed_msgs)))
 
                     if peer_id:
-                        self._send_ack(peer_id, msg_id)
+                        self._send_ack(peer_id, msg_id, conn=conn, write_lock=local_write_lock)
 
                     if is_duplicate:
                         continue
@@ -204,10 +204,17 @@ class TransportService:
                         del self.write_locks[peer_id]
             conn.close()
 
-    def _send_ack(self, peer_id: str, message_id: str) -> None:
-        with self.peers_lock:
-            conn = self.peers.get(peer_id)
-            write_lock = self.write_locks.get(peer_id)
+    def _send_ack(
+        self,
+        peer_id: str,
+        message_id: str,
+        conn: Optional[socket.socket] = None,
+        write_lock: Optional[threading.Lock] = None,
+    ) -> None:
+        if conn is None or write_lock is None:
+            with self.peers_lock:
+                conn = self.peers.get(peer_id)
+                write_lock = self.write_locks.get(peer_id)
 
         if not conn or not write_lock:
             return
