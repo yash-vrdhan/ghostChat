@@ -147,11 +147,16 @@ def main() -> None:
                 "ciphertext": ciphertext,
                 "signature": signature,
             }
-            transport.send_packet(target.ip, target.tcp_port, packet)
+            success = transport.send_packet(target.peer_id, target.ip, target.tcp_port, packet, wait_for_ack=True)
             with lock:
-                console.print(
-                    f"[cyan]INFO[/cyan] Encrypted message sent to {target.username} ({target.ip}:{target.tcp_port})"
-                )
+                if success:
+                    console.print(
+                        f"[cyan]INFO[/cyan] Encrypted message sent and ACKed by {target.username} ({target.ip}:{target.tcp_port})"
+                    )
+                else:
+                    console.print(
+                        f"[yellow]WARN[/yellow] Message sent to {target.username} but no ACK received."
+                    )
         except OSError as exc:
             with lock:
                 console.print(f"[yellow]WARN[/yellow] Send failed: {exc}")
@@ -163,7 +168,7 @@ def main() -> None:
         enc_public_key_b64=keys.enc_public_b64,
         sign_public_key_b64=keys.sign_public_b64,
     )
-    transport = TransportService(listen_port=args.port, on_message=on_message)
+    transport = TransportService(local_peer_id=peer_id, listen_port=args.port, on_message=on_message)
 
     discovery.start()
     transport.start()
@@ -245,11 +250,16 @@ def main() -> None:
                         "ciphertext": ciphertext,
                         "signature": signature,
                     }
-                    transport.send_packet(target.ip, target.tcp_port, packet)
+                    success = transport.send_packet(target.peer_id, target.ip, target.tcp_port, packet, wait_for_ack=True)
                     with lock:
-                        console.print(
-                            f"[cyan]INFO[/cyan] Encrypted message sent to {target_username}"
-                        )
+                        if success:
+                            console.print(
+                                f"[cyan]INFO[/cyan] Encrypted message sent and ACKed by {target_username}"
+                            )
+                        else:
+                            console.print(
+                                f"[yellow]WARN[/yellow] Message sent to {target_username} but no ACK received."
+                            )
                 except OSError as exc:
                     with lock:
                         console.print(f"[yellow]WARN[/yellow] Send failed: {exc}")
