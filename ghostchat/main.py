@@ -31,6 +31,7 @@ def main() -> None:
     console = Console()
     ui = TerminalUI(username=args.username, fingerprint=keys.fingerprint, port=args.port)
     lock = threading.RLock()
+    state = {"chat_peer": None, "pending_chats": {}}
 
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -52,6 +53,7 @@ def main() -> None:
             return
 
         sender = packet.get("sender", "unknown")
+        sender_peer_id = packet.get("sender_peer_id")
         sender_enc_public_b64 = packet.get("sender_enc_public_key")
         sender_sign_public_b64 = packet.get("sender_sign_public_key")
         ciphertext = packet.get("ciphertext")
@@ -80,7 +82,40 @@ def main() -> None:
             return
 
         with lock:
-            console.print(f"[bold green]{sender}[/bold green] [white]{plaintext}[/white]")
+            chat_peer = state["chat_peer"]
+            if chat_peer and sender_peer_id == chat_peer.peer_id:
+                console.print(
+                    f"[bold cyan][chat:{sender}][/bold cyan] [white]{plaintext}[/white]"
+                )
+            else:
+                console.print(f"[bold green]{sender}[/bold green] [white]{plaintext}[/white]")
+                if sender_peer_id:
+                    matched = next((p for p in discovery.peers() if p.peer_id == sender_peer_id), None)
+                    if matched is not None:
+                        if chat_peer is None:
+                            state["chat_peer"] = matched
+                            console.print(
+                                f"[cyan]INFO[/cyan] Auto-opened chat thread with {matched.username} "
+                                f"({matched.ip}:{matched.tcp_port}). Type reply directly or /exit."
+                            )
+                        elif chat_peer.peer_id != sender_peer_id:
+                            pending = state["pending_chats"]
+                            if sender_peer_id in pending:
+                                pending[sender_peer_id]["unread"] += 1
+                                pending[sender_peer_id]["peer"] = matched
+                                pending[sender_peer_id]["messages"].append(plaintext)
+                            else:
+                                pending[sender_peer_id] = {
+                                    "peer": matched,
+                                    "unread": 1,
+                                    "messages": [plaintext],
+                                }
+                            unread = pending[sender_peer_id]["unread"]
+                            console.print(
+                                f"[yellow]INFO[/yellow] New message from {matched.username} "
+                                f"({matched.ip}:{matched.tcp_port}) while active chat is "
+                                f"{chat_peer.username}. unread={unread}. Use '/chat switch' to switch."
+                            )
 
     def resolve_target(peers: list, target_token: str):
         # Explicit routing for duplicates: allow `username@port` or `ip:port`.
@@ -135,6 +170,34 @@ def main() -> None:
             return
 
         target = peers[index]
+        send_encrypted_message(target, text)
+
+    def pick_peer_interactive():
+        peers = discovery.peers()
+        if not peers:
+            with lock:
+                console.print("[yellow]WARN[/yellow] No peers discovered. Try again in a moment.")
+            return None
+
+        with lock:
+            console.print("[cyan]Select recipient:[/cyan]")
+            for idx, peer in enumerate(peers, start=1):
+                console.print(f"  {idx}. {peer.username} ({peer.ip}:{peer.tcp_port})")
+
+        selection = input("peer number> ").strip()
+        if not selection.isdigit():
+            with lock:
+                console.print("[yellow]WARN[/yellow] Invalid selection.")
+            return None
+
+        index = int(selection) - 1
+        if index < 0 or index >= len(peers):
+            with lock:
+                console.print("[yellow]WARN[/yellow] Selection out of range.")
+            return None
+        return peers[index]
+
+    def send_encrypted_message(target, text: str) -> bool:
         try:
             recipient_public = parse_public_key_b64(target.enc_public_key_b64)
             signature = sign_message(keys.sign_private, text)
@@ -147,7 +210,13 @@ def main() -> None:
                 "ciphertext": ciphertext,
                 "signature": signature,
             }
-            success = transport.send_packet(target.peer_id, target.ip, target.tcp_port, packet, wait_for_ack=True)
+            success = transport.send_packet(
+                target.peer_id,
+                target.ip,
+                target.tcp_port,
+                packet,
+                wait_for_ack=True,
+            )
             with lock:
                 if success:
                     console.print(
@@ -157,9 +226,88 @@ def main() -> None:
                     console.print(
                         f"[yellow]WARN[/yellow] Message sent to {target.username} but no ACK received."
                     )
+            return success
         except OSError as exc:
             with lock:
                 console.print(f"[yellow]WARN[/yellow] Send failed: {exc}")
+            return False
+
+    def start_chat_thread(target) -> None:
+        pending_entry = state["pending_chats"].pop(target.peer_id, None)
+        state["chat_peer"] = target
+        with lock:
+            console.print(
+                f"[bold cyan]Chat thread opened with {target.username} ({target.ip}:{target.tcp_port}). "
+                "Type messages directly. Use /exit to close thread.[/bold cyan]"
+            )
+            if pending_entry and pending_entry.get("messages"):
+                console.print("[cyan]Unread messages:[/cyan]")
+                for msg in pending_entry["messages"]:
+                    console.print(
+                        f"[bold cyan][chat:{target.username}][/bold cyan] [white]{msg}[/white]"
+                    )
+
+    def show_pending_chats() -> None:
+        pending = state["pending_chats"]
+        if not pending:
+            with lock:
+                console.print("[cyan]INFO[/cyan] No pending chats.")
+            return
+        with lock:
+            console.print("[cyan]Pending chats:[/cyan]")
+            for idx, item in enumerate(pending.values(), start=1):
+                peer = item["peer"]
+                unread = item["unread"]
+                console.print(
+                    f"  {idx}. {peer.username} ({peer.ip}:{peer.tcp_port}) unread={unread}"
+                )
+
+    def switch_chat_thread(target_token: str | None = None) -> None:
+        pending = state["pending_chats"]
+        if not pending:
+            with lock:
+                console.print("[cyan]INFO[/cyan] No pending chats to switch.")
+            return
+
+        if target_token is None:
+            with lock:
+                console.print("[cyan]Select pending chat to switch:[/cyan]")
+                items = list(pending.values())
+                for idx, item in enumerate(items, start=1):
+                    peer = item["peer"]
+                    console.print(
+                        f"  {idx}. {peer.username} ({peer.ip}:{peer.tcp_port}) unread={item['unread']}"
+                    )
+            selection = input("switch number> ").strip()
+            if not selection.isdigit():
+                with lock:
+                    console.print("[yellow]WARN[/yellow] Invalid selection.")
+                return
+            index = int(selection) - 1
+            if index < 0 or index >= len(items):
+                with lock:
+                    console.print("[yellow]WARN[/yellow] Selection out of range.")
+                return
+            start_chat_thread(items[index]["peer"])
+            return
+
+        peers = [item["peer"] for item in pending.values()]
+        resolved = resolve_target(peers, target_token)
+        if resolved is None:
+            with lock:
+                console.print(
+                    f"[yellow]WARN[/yellow] Pending chat target '{target_token}' not found."
+                )
+            return
+        if isinstance(resolved, list):
+            options = ", ".join(f"{p.username}@{p.tcp_port} ({p.ip}:{p.tcp_port})" for p in resolved)
+            with lock:
+                console.print(
+                    f"[yellow]WARN[/yellow] Multiple pending peers for '{target_token}': {options}. "
+                    "Use '/chat switch' interactive picker."
+                )
+            return
+        start_chat_thread(resolved)
 
     discovery = DiscoveryService(
         peer_id=peer_id,
@@ -205,6 +353,11 @@ def main() -> None:
                     console.print("[cyan]INFO[/cyan] /peers: show discovered peers")
                     console.print("[cyan]INFO[/cyan] /msg <username> <text>: send encrypted message")
                     console.print("[cyan]INFO[/cyan] /msg: interactive recipient picker")
+                    console.print("[cyan]INFO[/cyan] /chat or /chat-thread: open interactive chat thread")
+                    console.print("[cyan]INFO[/cyan] /chat <target>: open thread to username / username@port / ip:port")
+                    console.print("[cyan]INFO[/cyan] /chat switch [target]: switch to pending chat")
+                    console.print("[cyan]INFO[/cyan] /chat pending: list pending chats")
+                    console.print("[cyan]INFO[/cyan] /exit: close current chat thread")
                     console.print("[cyan]INFO[/cyan] /quit: exit")
                 continue
 
@@ -238,31 +391,78 @@ def main() -> None:
                         )
                     continue
                 target = resolved
-                try:
-                    recipient_public = parse_public_key_b64(target.enc_public_key_b64)
-                    signature = sign_message(keys.sign_private, text)
-                    ciphertext = encrypt_message(keys.enc_private, recipient_public, text)
-                    packet = {
-                        "type": "MESSAGE",
-                        "sender": args.username,
-                        "sender_enc_public_key": keys.enc_public_b64,
-                        "sender_sign_public_key": keys.sign_public_b64,
-                        "ciphertext": ciphertext,
-                        "signature": signature,
-                    }
-                    success = transport.send_packet(target.peer_id, target.ip, target.tcp_port, packet, wait_for_ack=True)
+                send_encrypted_message(target, text)
+                continue
+
+            if line == "/chat" or line == "/chat-thread":
+                target = pick_peer_interactive()
+                if target:
+                    start_chat_thread(target)
+                continue
+
+            if line == "/chat pending":
+                show_pending_chats()
+                continue
+
+            if line == "/chat switch":
+                switch_chat_thread()
+                continue
+
+            if line.startswith("/chat switch "):
+                target_token = line.split(" ", 2)[2].strip()
+                if not target_token:
                     with lock:
-                        if success:
-                            console.print(
-                                f"[cyan]INFO[/cyan] Encrypted message sent and ACKed by {target_username}"
-                            )
-                        else:
-                            console.print(
-                                f"[yellow]WARN[/yellow] Message sent to {target_username} but no ACK received."
-                            )
-                except OSError as exc:
+                        console.print("[yellow]WARN[/yellow] Usage: /chat switch [target]")
+                    continue
+                switch_chat_thread(target_token)
+                continue
+
+            if line.startswith("/chat ") or line.startswith("/chat-thread "):
+                parts = line.split(" ", 1)
+                if len(parts) < 2:
                     with lock:
-                        console.print(f"[yellow]WARN[/yellow] Send failed: {exc}")
+                        console.print("[yellow]WARN[/yellow] Usage: /chat <target>")
+                    continue
+                target_token = parts[1].strip()
+                peers = discovery.peers()
+                resolved = resolve_target(peers, target_token)
+                if resolved is None:
+                    with lock:
+                        console.print(
+                            f"[yellow]WARN[/yellow] Peer '{target_token}' not found. Try /peers"
+                        )
+                    continue
+                if isinstance(resolved, list):
+                    options = ", ".join(
+                        f"{p.username}@{p.tcp_port} ({p.ip}:{p.tcp_port})" for p in resolved
+                    )
+                    with lock:
+                        console.print(
+                            f"[yellow]WARN[/yellow] Multiple peers named '{target_token}': {options}. "
+                            "Use '/chat <username>@<port>' or '/chat' picker."
+                        )
+                    continue
+                start_chat_thread(resolved)
+                continue
+
+            if state["chat_peer"] is not None:
+                if line == "/exit":
+                    with lock:
+                        console.print("[cyan]INFO[/cyan] Chat thread closed.")
+                    state["chat_peer"] = None
+                    continue
+                if line.startswith("/"):
+                    with lock:
+                        console.print("[yellow]WARN[/yellow] Unknown chat command. Use /exit to close chat.")
+                    continue
+                target = state["chat_peer"]
+                success = send_encrypted_message(target, line)
+                if not success:
+                    with lock:
+                        console.print(
+                            "[yellow]WARN[/yellow] Chat thread closed because peer is offline or ACK failed."
+                        )
+                    state["chat_peer"] = None
                 continue
 
             if line == "/quit":

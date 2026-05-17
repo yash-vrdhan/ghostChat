@@ -64,5 +64,7 @@ class TerminalUI:
     def dashboard(self, peers: Iterable[object]) -> Group:
         return Group(
             self.peers_panel(peers),
-            Text("Commands: /peers, /msg <username> <text>, /help, /quit\n"),
+            Text(
+                "Commands: /peers, /msg <username> <text>, /chat, /chat switch, /chat pending, /help, /exit, /quit\n"
+            ),
         )
