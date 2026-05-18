@@ -12,6 +12,8 @@ from ghostchat.crypto.keys import (
     parse_verify_key_b64,
 )
 from ghostchat.crypto.signing import sign_message, verify_signature
+from ghostchat.media.encoder import MediaEncoder
+from ghostchat.media.decoder import MediaDecoder
 from ghostchat.network.discovery import DiscoveryService
 from ghostchat.network.transport import TransportService
 from ghostchat.ui.terminal import TerminalUI
@@ -33,6 +35,10 @@ def main() -> None:
     lock = threading.RLock()
     state = {"chat_peer": None, "pending_chats": {}}
 
+    media_storage = os.path.expanduser(f"~/.ghostchat/{args.username}/media")
+    encoder = MediaEncoder()
+    decoder = MediaDecoder(media_storage)
+
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -49,7 +55,8 @@ def main() -> None:
             console.print(ui.dashboard(discovery.peers()))
 
     def on_message(packet: dict) -> None:
-        if packet.get("type") != "MESSAGE":
+        msg_type = packet.get("type")
+        if msg_type not in ["MESSAGE", "IMAGE", "GIF", "FILE_CHUNK", "FILE_COMPLETE", "RETRANSMIT_REQUEST"]:
             return
 
         sender = packet.get("sender", "unknown")
@@ -79,6 +86,52 @@ def main() -> None:
                 console.print(
                     f"[yellow]WARN[/yellow] Signature verification failed for sender {sender}"
                 )
+            return
+
+        if msg_type == "FILE_CHUNK":
+            import base64
+            chunk_data = base64.b64decode(plaintext)
+            chunk_index = packet.get("chunk_index")
+            total_chunks = packet.get("total_chunks")
+            media_type = packet.get("media_type")
+            filename = packet.get("filename")
+            msg_id = packet.get("message_id")
+
+            save_path = decoder.handle_chunk(sender_peer_id, msg_id, chunk_index, total_chunks, chunk_data, media_type, filename)
+
+            if save_path:
+                with lock:
+                    console.print(f"[bold cyan][{sender}][/bold cyan] sent {media_type.lower()}: {filename}")
+                # Trigger rendering in a separate thread to not block on_message
+                def render():
+                    decoder.render_media(save_path, media_type)
+                threading.Thread(target=render, daemon=True).start()
+
+            # Check for missing chunks and request retransmit if needed
+            # For simplicity, we'll do this after every chunk for now if it's not complete
+            missing = decoder.chunk_manager.get_missing_chunks(sender_peer_id, msg_id)
+            if missing and chunk_index == total_chunks - 1: # Only if we got the last one but still missing some
+                 request = {
+                     "type": "RETRANSMIT_REQUEST",
+                     "sender": args.username,
+                     "sender_enc_public_key": keys.enc_public_b64,
+                     "sender_sign_public_key": keys.sign_public_b64,
+                     "message_id": msg_id,
+                     "missing_chunks": missing
+                 }
+                 # We need to resolve the sender's ip/port to send the request back
+                 # For now, let's assume we can find them in discovery
+                 matched = next((p for p in discovery.peers() if p.peer_id == sender_peer_id), None)
+                 if matched:
+                     transport.send_packet(matched.peer_id, matched.ip, matched.tcp_port, request)
+            return
+
+        if msg_type == "RETRANSMIT_REQUEST":
+            # Handle retransmit request (sender side)
+            # This would require keeping track of sent files/chunks
+            # For the first iteration, we might just log it
+            with lock:
+                console.print(f"[yellow]INFO[/yellow] Received retransmit request from {sender} for {packet.get('message_id')}")
             return
 
         with lock:
@@ -196,6 +249,66 @@ def main() -> None:
                 console.print("[yellow]WARN[/yellow] Selection out of range.")
             return None
         return peers[index]
+
+    def send_media(target, filepath: str, media_type: str) -> bool:
+        import base64
+        import uuid
+        import tempfile
+
+        try:
+            filename = os.path.basename(filepath)
+
+            # Optimize media
+            with tempfile.NamedTemporaryFile(suffix=os.path.splitext(filename)[1], delete=False) as tmp:
+                optimized_path = encoder.optimize_image(filepath, tmp.name)
+
+            chunks = decoder.chunk_manager.split_file(optimized_path)
+            total_chunks = len(chunks)
+            message_id = str(uuid.uuid4())
+
+            recipient_public = parse_public_key_b64(target.enc_public_key_b64)
+
+            success = True
+            for i, chunk in enumerate(chunks):
+                chunk_b64 = base64.b64encode(chunk).decode("utf-8")
+                signature = sign_message(keys.sign_private, chunk_b64)
+                ciphertext = encrypt_message(keys.enc_private, recipient_public, chunk_b64)
+
+                packet = {
+                    "type": "FILE_CHUNK",
+                    "media_type": media_type,
+                    "filename": filename,
+                    "message_id": message_id,
+                    "chunk_index": i,
+                    "total_chunks": total_chunks,
+                    "sender": args.username,
+                    "sender_enc_public_key": keys.enc_public_b64,
+                    "sender_sign_public_key": keys.sign_public_b64,
+                    "ciphertext": ciphertext,
+                    "signature": signature,
+                }
+
+                # Send chunk. Maybe don't wait for ACK for every single chunk to speed up?
+                # But requirement says "ACK tracking for chunks"
+                if not transport.send_packet(target.peer_id, target.ip, target.tcp_port, packet, wait_for_ack=True):
+                    success = False
+                    break
+
+            if optimized_path != filepath:
+                try: os.unlink(optimized_path)
+                except: pass
+
+            with lock:
+                if success:
+                    console.print(f"[cyan]INFO[/cyan] {media_type} '{filename}' sent successfully to {target.username}")
+                else:
+                    console.print(f"[yellow]WARN[/yellow] Failed to send {media_type} to {target.username}")
+            return success
+
+        except Exception as e:
+            with lock:
+                console.print(f"[red]Error sending media: {e}[/red]")
+            return False
 
     def send_encrypted_message(target, text: str) -> bool:
         try:
@@ -353,6 +466,8 @@ def main() -> None:
                     console.print("[cyan]INFO[/cyan] /peers: show discovered peers")
                     console.print("[cyan]INFO[/cyan] /msg <username> <text>: send encrypted message")
                     console.print("[cyan]INFO[/cyan] /msg: interactive recipient picker")
+                    console.print("[cyan]INFO[/cyan] /sendimg <target> <path>: send image")
+                    console.print("[cyan]INFO[/cyan] /sendgif <target> <path>: send gif")
                     console.print("[cyan]INFO[/cyan] /chat or /chat-thread: open interactive chat thread")
                     console.print("[cyan]INFO[/cyan] /chat <target>: open thread to username / username@port / ip:port")
                     console.print("[cyan]INFO[/cyan] /chat switch [target]: switch to pending chat")
@@ -363,6 +478,36 @@ def main() -> None:
 
             if line == "/msg":
                 interactive_send_message()
+                continue
+
+            if line.startswith("/sendimg ") or line.startswith("/sendgif "):
+                parts = line.split(" ", 2)
+                if len(parts) < 3:
+                    cmd = parts[0]
+                    with lock:
+                        console.print(f"[yellow]WARN[/yellow] Usage: {cmd} <target> <path>")
+                    continue
+
+                cmd, target_token, filepath = parts[0], parts[1], parts[2]
+                media_type = "IMAGE" if cmd == "/sendimg" else "GIF"
+
+                peers = discovery.peers()
+                resolved = resolve_target(peers, target_token)
+                if resolved is None:
+                    with lock:
+                        console.print(f"[yellow]WARN[/yellow] Peer '{target_token}' not found.")
+                    continue
+                if isinstance(resolved, list):
+                    with lock:
+                        console.print(f"[yellow]WARN[/yellow] Multiple peers found for '{target_token}'. Use more specific target.")
+                    continue
+
+                if not os.path.exists(filepath):
+                    with lock:
+                        console.print(f"[yellow]WARN[/yellow] File not found: {filepath}")
+                    continue
+
+                send_media(resolved, filepath, media_type)
                 continue
 
             if line.startswith("/msg "):
@@ -451,6 +596,26 @@ def main() -> None:
                         console.print("[cyan]INFO[/cyan] Chat thread closed.")
                     state["chat_peer"] = None
                     continue
+
+                if line.startswith("/sendimg ") or line.startswith("/sendgif "):
+                    parts = line.split(" ", 1)
+                    if len(parts) < 2:
+                        cmd = parts[0]
+                        with lock:
+                            console.print(f"[yellow]WARN[/yellow] Usage: {cmd} <path>")
+                        continue
+
+                    cmd, filepath = parts[0], parts[1].strip()
+                    media_type = "IMAGE" if cmd == "/sendimg" else "GIF"
+
+                    if not os.path.exists(filepath):
+                        with lock:
+                            console.print(f"[yellow]WARN[/yellow] File not found: {filepath}")
+                        continue
+
+                    send_media(state["chat_peer"], filepath, media_type)
+                    continue
+
                 if line.startswith("/"):
                     with lock:
                         console.print("[yellow]WARN[/yellow] Unknown chat command. Use /exit to close chat.")
