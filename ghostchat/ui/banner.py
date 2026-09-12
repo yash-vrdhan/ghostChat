@@ -61,9 +61,9 @@ def get_welcome_dashboard_renderable(username: str, port: int, fingerprint: str)
 
     hints = Text.from_markup(
         "\n[bold yellow]⚡ Quick Start:[/bold yellow]\n"
-        "  • Select a peer from the [cyan]Peers Sidebar[/cyan] on the left to start chatting.\n"
-        "  • Or type [cyan]/msg <username> <text>[/cyan] in the input dock below.\n"
-        "  • Send encrypted media: [cyan]/sendimg <path>[/cyan] or [cyan]/sendgif <path>[/cyan].\n"
+        "  • Select a peer or channel ([bold magenta]#general[/bold magenta]) on the left to start chatting.\n"
+        "  • Join or create private channels: [cyan]/join <#channel> [passkey][/cyan] or [cyan]/key <passkey>[/cyan]\n"
+        "  • Send private DM: [cyan]/msg <@username> <text>[/cyan] or media: [cyan]/sendimg <path>[/cyan]\n"
         "  • Press [bold white]Esc[/bold white] to return to this dashboard at any time.\n"
         "  • Type [cyan]/help[/cyan] for the complete command reference.\n"
     )

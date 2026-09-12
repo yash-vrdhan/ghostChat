@@ -6,9 +6,10 @@ import socket
 import tempfile
 import threading
 import uuid
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from rich.console import Console
+from rich.markup import escape
 
 from ghostchat.crypto.encrypt import decrypt_message, encrypt_message
 from ghostchat.crypto.keys import (
@@ -22,7 +23,7 @@ from ghostchat.crypto.signing import sign_message, verify_signature
 from ghostchat.media.decoder import MediaDecoder
 from ghostchat.media.encoder import MediaEncoder
 from ghostchat.network.discovery import DiscoveryService, Peer
-from ghostchat.network.gossip import GossipService
+from ghostchat.network.gossip import GossipService, derive_channel_key
 from ghostchat.network.transport import TransportService
 from ghostchat.protocol.packets import MessagePacket
 from ghostchat.session.manager import SessionManager
@@ -101,12 +102,20 @@ class GhostChatApp:
             sender_username=packet.sender_username,
             text=decoded_text,
             timestamp=packet.timestamp,
+            raw_content=packet.content if packet.is_encrypted else None,
+            is_encrypted=packet.is_encrypted,
         )
-        for cb in self.ui_listeners.get("group_message", []):
-            try:
-                cb(packet.channel, packet.sender_username, decoded_text, routing)
-            except Exception:
-                pass
+        if self.ui_listeners.get("group_message"):
+            for cb in self.ui_listeners["group_message"]:
+                try:
+                    cb(packet.channel, packet.sender_username, decoded_text, routing)
+                except Exception:
+                    pass
+        else:
+            if packet.sender_username != self.username:
+                self.console.print(
+                    f"[bold magenta]{escape(f'[{packet.channel} | @{packet.sender_username}]')}:[/bold magenta] [white]{escape(decoded_text)}[/white]"
+                )
 
     def _on_channel_change(self, channel: str, member_count: int) -> None:
         for cb in self.ui_listeners.get("channel_change", []):
@@ -118,10 +127,19 @@ class GhostChatApp:
     def send_group_message(self, channel: str, text: str) -> None:
         self.gossip.publish(channel, text)
 
+    def set_channel_key(self, channel: str, passphrase: str) -> Tuple[str, int]:
+        canonical = channel.lower()
+        if not canonical.startswith("#"):
+            canonical = f"#{canonical}"
+        self.gossip.set_channel_key(canonical, passphrase)
+        key = derive_channel_key(canonical, passphrase)
+        unlocked = self.session.unlock_channel(canonical, key)
+        return canonical, unlocked
+
     def join_channel(self, channel: str, passphrase: Optional[str] = None) -> str:
         canonical = self.session.join_channel(channel)
         if passphrase:
-            self.gossip.set_channel_key(canonical, passphrase)
+            self.set_channel_key(canonical, passphrase)
         self.gossip.announce_channel(canonical, "JOIN")
         return canonical
 

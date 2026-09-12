@@ -1,5 +1,8 @@
+import base64
 import threading
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
+
+from nacl.secret import SecretBox
 
 from ghostchat.network.discovery import Peer
 
@@ -94,6 +97,8 @@ class SessionManager:
         sender_username: str,
         text: str,
         timestamp: float,
+        raw_content: Optional[str] = None,
+        is_encrypted: bool = False,
     ) -> Dict[str, Any]:
         """Record an incoming group message into the channel history and update unread count."""
         with self._lock:
@@ -106,6 +111,8 @@ class SessionManager:
                 "sender": sender_username,
                 "text": text,
                 "timestamp": timestamp,
+                "raw_content": raw_content,
+                "is_encrypted": is_encrypted,
             }
 
             if channel not in self._channel_messages:
@@ -123,6 +130,24 @@ class SessionManager:
                 "unread": self._channel_unread[channel],
                 "entry": msg_entry,
             }
+
+    def unlock_channel(self, channel: str, key: bytes) -> int:
+        """Attempt to re-decrypt any locked messages in channel history using key. Returns number of unlocked messages."""
+        with self._lock:
+            channel = channel.lower()
+            if not channel.startswith("#"):
+                channel = f"#{channel}"
+            unlocked = 0
+            box = SecretBox(key)
+            for entry in self._channel_messages.get(channel, []):
+                if entry.get("is_encrypted") and entry.get("raw_content") and entry.get("text", "").startswith("[🔒"):
+                    try:
+                        decrypted = box.decrypt(base64.b64decode(entry["raw_content"])).decode("utf-8")
+                        entry["text"] = decrypted
+                        unlocked += 1
+                    except Exception:
+                        pass
+            return unlocked
 
     def close_active_thread(self) -> None:
         with self._lock:

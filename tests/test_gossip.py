@@ -225,3 +225,67 @@ def test_tui_channel_thread_open_and_messaging(tmp_path, monkeypatch) -> None:
             assert history[-1]["text"] == "Testing channel broadcast"
 
     asyncio.run(run())
+
+
+def test_retroactive_channel_unlock_with_key(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("ghostchat.crypto.keys.KEY_ROOT_DIR", tmp_path)
+    backend = GhostChatApp(username="alice", port=59995)
+
+    # Bob sends encrypted message to #private-team
+    key = derive_channel_key("#private-team", "secret123")
+    box = SecretBox(key)
+    ciphertext_b64 = base64.b64encode(box.encrypt(b"Super secret payload")).decode("utf-8")
+
+    packet = GroupMessagePacket(
+        channel="#private-team",
+        message_id="msg-1",
+        sender_username="bob",
+        sender_peer_id="bob_node",
+        sender_sign_public_key="",
+        timestamp=time.time(),
+        content=ciphertext_b64,
+        is_encrypted=True,
+    )
+
+    # Alice receives it before having the key
+    backend.gossip.handle_group_packet(packet.to_dict())
+
+    # Check that Alice's session recorded it as locked
+    messages = backend.session.get_channel_messages("#private-team")
+    assert len(messages) == 1
+    assert "key required to view" in messages[0]["text"]
+
+    # Now Alice enters key with set_channel_key
+    canonical, unlocked_count = backend.set_channel_key("#private-team", "secret123")
+    assert canonical == "#private-team"
+    assert unlocked_count == 1
+
+    # Verify history now has decrypted message
+    messages_after = backend.session.get_channel_messages("#private-team")
+    assert messages_after[0]["text"] == "Super secret payload"
+
+
+def test_group_message_markup_escaping() -> None:
+    from rich.console import Console
+    from rich.markup import escape
+
+    console = Console(record=True)
+    channel = "#general"
+    sender = "bob"
+    text = "Hello @all [cool]"
+
+    # If unescaped, [#general | @bob] is eaten as a color tag
+    unescaped_line = f"[{channel} | @{sender}]: {text}"
+    console.print(unescaped_line)
+    output_unescaped = console.export_text()
+    assert "@bob" not in output_unescaped  # Disappeared!
+
+    # When properly escaped with escape()
+    console_escaped = Console(record=True)
+    escaped_label = escape(f"[{channel} | @{sender}]")
+    console_escaped.print(f"[bold magenta]{escaped_label}:[/bold magenta] [white]{escape(text)}[/white]")
+    output_escaped = console_escaped.export_text()
+    assert "@bob" in output_escaped
+    assert "#general" in output_escaped
+    assert "[cool]" in output_escaped
+

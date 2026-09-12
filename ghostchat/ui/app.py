@@ -3,6 +3,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
+from rich.markup import escape
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
@@ -286,13 +287,13 @@ class GhostChatTUIApp(App):
             if routing.get("action") == "active":
                 if sender != self.backend.username:
                     chat_log.write(
-                        f"[{timestamp}] [bold magenta][{channel} | @{sender}]:[/bold magenta] [white]{text}[/white]"
+                        f"[{timestamp}] [bold magenta]{escape(f'[{channel} | @{sender}]')}:[/bold magenta] [white]{escape(text)}[/white]"
                     )
             else:
                 self.refresh_channels_sidebar()
                 if self.active_peer or self.backend.session.active_channel:
                     chat_log.write(
-                        f"[dim][{timestamp}] [yellow]Notice:[/yellow] New message in [bold magenta]{channel}[/bold magenta] from @{sender}.[/dim]"
+                        f"[dim][{timestamp}] [yellow]Notice:[/yellow] New message in [bold magenta]{escape(channel)}[/bold magenta] from @{escape(sender)}.[/dim]"
                     )
 
         self.call_from_thread(update_ui)
@@ -322,23 +323,23 @@ class GhostChatTUIApp(App):
             timestamp = time.strftime("%H:%M:%S")
 
             if routing.get("action") == "active":
-                chat_log.write(f"[{timestamp}] [bold cyan][@{sender}]:[/bold cyan] [white]{text}[/white]")
+                chat_log.write(f"[{timestamp}] [bold cyan]{escape(f'[@{sender}]')}:[/bold cyan] [white]{escape(text)}[/white]")
             elif routing.get("action") == "auto_opened":
                 # Auto-open thread
                 matched = routing.get("peer")
                 if matched:
                     self.open_chat_thread(matched, quiet=True)
-                chat_log.write(f"[{timestamp}] [bold cyan][@{sender}]:[/bold cyan] [white]{text}[/white]")
+                chat_log.write(f"[{timestamp}] [bold cyan]{escape(f'[@{sender}]')}:[/bold cyan] [white]{escape(text)}[/white]")
             elif routing.get("action") == "queued":
                 # Background unread
                 self.refresh_peer_sidebar()
                 if self.active_peer:
                     chat_log.write(
-                        f"[dim][{timestamp}] [yellow]Notice:[/yellow] New message from @{sender}. "
+                        f"[dim][{timestamp}] [yellow]Notice:[/yellow] New message from @{escape(sender)}. "
                         "Switch peer to view.[/dim]"
                     )
             else:
-                chat_log.write(f"[{timestamp}] [bold green][@{sender}]:[/bold green] [white]{text}[/white]")
+                chat_log.write(f"[{timestamp}] [bold green]{escape(f'[@{sender}]')}:[/bold green] [white]{escape(text)}[/white]")
 
         self.call_from_thread(update_ui)
 
@@ -346,7 +347,7 @@ class GhostChatTUIApp(App):
         def update_ui() -> None:
             chat_log = self.query_one("#chat-log", RichLog)
             timestamp = time.strftime("%H:%M:%S")
-            chat_log.write(f"[{timestamp}] [bold magenta]Received {media_type} from @{sender}:[/bold magenta]")
+            chat_log.write(f"[{timestamp}] [bold magenta]Received {media_type} from @{escape(sender)}:[/bold magenta]")
             try:
                 ascii_text = self.backend.encoder_renderer_helper(filepath)
                 chat_log.write(Text(ascii_text, style="cyan"))
@@ -385,7 +386,7 @@ class GhostChatTUIApp(App):
         if pending_entry and pending_entry.get("messages"):
             for msg in pending_entry["messages"]:
                 chat_log.write(
-                    f"[bold cyan][@{peer.username}]:[/bold cyan] [white]{msg}[/white]"
+                    f"[bold cyan]{escape(f'[@{peer.username}]')}:[/bold cyan] [white]{escape(msg)}[/white]"
                 )
 
         self.refresh_peer_sidebar()
@@ -404,9 +405,11 @@ class GhostChatTUIApp(App):
         chat_log.clear()
 
         member_count = self.backend.gossip.get_channel_members_count(channel)
+        is_keyed = channel.lower() in self.backend.gossip.channel_keys
+        enc_badge = "[green]🔒 Keyed Private[/green]" if is_keyed else "[dim]🔓 Mesh (Type /key <pass> to encrypt)[/dim]"
         chat_header.update(
-            f"📢 Channel [bold magenta]{channel}[/bold magenta] • "
-            f"[dim]{member_count} member(s) online • Gossip Mesh Active[/dim]"
+            f"📢 Channel [bold magenta]{escape(channel)}[/bold magenta] • "
+            f"[dim]{member_count} member(s) online[/dim] • {enc_badge}"
         )
         message_input.placeholder = f"Message {channel}... (Press Esc to exit channel)"
         message_input.focus()
@@ -414,7 +417,7 @@ class GhostChatTUIApp(App):
         if not quiet:
             timestamp = time.strftime("%H:%M:%S")
             chat_log.write(
-                f"[dim][{timestamp}] ── Connected to {channel} (Decentralized Mesh) ──[/dim]"
+                f"[dim][{timestamp}] ── Connected to {escape(channel)} ({enc_badge}) ──[/dim]"
             )
 
         # Replay history
@@ -424,9 +427,9 @@ class GhostChatTUIApp(App):
             sender = entry.get("sender", "unknown")
             text = entry.get("text", "")
             if sender == self.backend.username:
-                chat_log.write(f"[{t}] [bold blue][You]:[/bold blue] [white]{text}[/white]")
+                chat_log.write(f"[{t}] [bold blue][You]:[/bold blue] [white]{escape(text)}[/white]")
             else:
-                chat_log.write(f"[{t}] [bold magenta][{channel} | @{sender}]:[/bold magenta] [white]{text}[/white]")
+                chat_log.write(f"[{t}] [bold magenta]{escape(f'[{channel} | @{sender}]')}:[/bold magenta] [white]{escape(text)}[/white]")
 
         self.refresh_channels_sidebar()
 
@@ -479,7 +482,7 @@ class GhostChatTUIApp(App):
         # Active channel thread (gossip broadcast)
         if self.backend.session.active_channel:
             channel = self.backend.session.active_channel
-            chat_log.write(f"[{timestamp}] [bold blue][You]:[/bold blue] [white]{text}[/white]")
+            chat_log.write(f"[{timestamp}] [bold blue][You]:[/bold blue] [white]{escape(text)}[/white]")
             threading.Thread(
                 target=self.backend.send_group_message,
                 args=(channel, text),
@@ -490,7 +493,7 @@ class GhostChatTUIApp(App):
         # Regular message in active 1-on-1 peer chat thread
         if self.active_peer is not None:
             peer = self.active_peer
-            chat_log.write(f"[{timestamp}] [bold blue][You]:[/bold blue] [white]{text}[/white]")
+            chat_log.write(f"[{timestamp}] [bold blue][You]:[/bold blue] [white]{escape(text)}[/white]")
             threading.Thread(
                 target=self._send_message_worker,
                 args=(peer, text),
@@ -560,6 +563,33 @@ class GhostChatTUIApp(App):
             )
             return
 
+        if cmd_line.startswith("/key"):
+            parts = cmd_line.split(" ")
+            target_ch = None
+            passphrase = None
+            if len(parts) == 2:
+                target_ch = self.backend.session.active_channel
+                passphrase = parts[1].strip()
+                if not target_ch:
+                    chat_log.write("[yellow]Usage: /key <passphrase> (in active channel) or /key <#channel> <passphrase>[/yellow]")
+                    return
+            elif len(parts) >= 3:
+                target_ch = parts[1].strip()
+                passphrase = parts[2].strip()
+            else:
+                chat_log.write("[yellow]Usage: /key <passphrase> or /key <#channel> <passphrase>[/yellow]")
+                return
+
+            canonical, unlocked = self.backend.set_channel_key(target_ch, passphrase)
+            msg = f"[{timestamp}] [green]Encryption key activated for {canonical}.[/green]"
+            if unlocked > 0:
+                msg += f" [cyan]Decrypted {unlocked} historical message(s)![/cyan]"
+            chat_log.write(msg)
+
+            if self.backend.session.active_channel == canonical:
+                self.open_channel_thread(canonical, quiet=True)
+            return
+
         if cmd_line.startswith("/leave"):
             parts = cmd_line.split(" ", 1)
             target_ch = parts[1].strip() if len(parts) > 1 else self.backend.session.active_channel
@@ -581,10 +611,11 @@ class GhostChatTUIApp(App):
             chat_log.write(f"[bold cyan]── GhostChat Command Manual ──[/bold cyan]")
             chat_log.write("  • [cyan]/channels[/cyan] : List subscribed group channels")
             chat_log.write("  • [cyan]/join <#channel> [passkey][/cyan] : Join or create a group channel")
+            chat_log.write("  • [cyan]/key [channel] <passkey>[/cyan] : Set or unlock channel encryption key")
             chat_log.write("  • [cyan]/leave <#channel>[/cyan] : Leave a group channel")
             chat_log.write("  • [cyan]/peers[/cyan] : Show discovered LAN peers")
             chat_log.write("  • [cyan]/msg <target> <text>[/cyan] : Send message (target can be @user or #channel)")
-            chat_log.write("  • [cyan]/chat <target>[/cyan] : Open dedicated thread with peer")
+            chat_log.write("  • [cyan]/chat <target>[/cyan] : Open dedicated thread with peer or #channel")
             chat_log.write("  • [cyan]/sendimg <target> <path>[/cyan] : Send encrypted image")
             chat_log.write("  • [cyan]/sendgif <target> <path>[/cyan] : Send encrypted animated GIF")
             chat_log.write("  • [cyan]/exit[/cyan] : Close current chat thread and return to dashboard")
@@ -602,18 +633,18 @@ class GhostChatTUIApp(App):
             if target_token.startswith("#"):
                 self.backend.send_group_message(target_token, msg_text)
                 chat_log.write(
-                    f"[{timestamp}] [bold blue][To {target_token}]:[/bold blue] [white]{msg_text}[/white]"
+                    f"[{timestamp}] [bold blue]{escape(f'[To {target_token}]')}:[/bold blue] [white]{escape(msg_text)}[/white]"
                 )
                 return
 
             resolved = SessionManager.resolve_target(self.backend.discovery.peers(), target_token)
             if resolved is None:
-                chat_log.write(f"[yellow]Peer '{target_token}' not found.[/yellow]")
+                chat_log.write(f"[yellow]Peer '{escape(target_token)}' not found.[/yellow]")
                 return
             if isinstance(resolved, list):
-                chat_log.write(f"[yellow]Multiple peers match '{target_token}'. Specify username@port.[/yellow]")
+                chat_log.write(f"[yellow]Multiple peers match '{escape(target_token)}'. Specify username@port.[/yellow]")
                 return
-            chat_log.write(f"[{timestamp}] [bold blue][To @{resolved.username}]:[/bold blue] [white]{msg_text}[/white]")
+            chat_log.write(f"[{timestamp}] [bold blue]{escape(f'[To @{resolved.username}]')}:[/bold blue] [white]{escape(msg_text)}[/white]")
             threading.Thread(target=self._send_message_worker, args=(resolved, msg_text), daemon=True).start()
             return
 

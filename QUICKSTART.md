@@ -131,11 +131,25 @@ To join a channel:
   <img src="docs/assets/05_group_channel.png" alt="Multi-Party Group Channel" width="850">
 </p>
 
-### How the Gossip Mesh Works:
-- **Zero Central Server**: Messages hop from peer to peer across the network.
+### How the Gossip Mesh & Private Channels Work:
+- **Zero Central Server**: Messages hop from peer to peer across the network using Epidemic Gossip Protocol with TTL flooding.
 - **Flooding Control**: A bounded LRU Seen Cache suppresses duplicate packets in $O(1)$ time, eliminating broadcast storms.
 - **Ed25519 Origin Authentication**: Every group message is signed by the originator; intermediate relay nodes cannot tamper with or forge messages.
-- **Keyed Channels**: For private channels (`/join #secret <key>`), messages are encrypted with authenticated `SecretBox` (XSalsa20-Poly1305). Only members with the passphrase can decrypt, while non-members can relay the ciphertext across the mesh.
+- **Keyed Channels (End-to-End Encryption)**:
+  - Join or create with passphrase:
+    ```text
+    /join #team-alpha MySecretPassphrase
+    ```
+  - Or unlock/set key while in a channel:
+    ```text
+    /key MySecretPassphrase
+    # Or specify channel explicitly:
+    /key #team-alpha MySecretPassphrase
+    ```
+  - **Retroactive Unlock**: Entering the key immediately decrypts any locked messages already in the channel history.
+  - **Zero-Knowledge Mesh Relaying**: Nodes without the passphrase forward the encrypted ciphertext to keep the mesh alive, but cannot read contents (they see `[🔒 Encrypted message: key required to view]`).
+- **Sender Attribution**:
+  - Every group message displays sender and channel prominently: `[#channel | @sender]: message text`.
 
 ---
 
@@ -159,6 +173,7 @@ Type these commands directly into the bottom input bar:
 | :--- | :--- | :--- |
 | `/channels` | `/channels` | Lists all joined group channels and member counts |
 | `/join` | `/join <#channel> [passkey]` | Joins or creates a group channel (optional encryption) |
+| `/key` | `/key [channel] <passkey>` | Sets or unlocks channel encryption key (auto-decrypts history) |
 | `/leave` | `/leave <#channel>` | Leaves a group channel |
 | `/peers` | `/peers` | Displays a list of all currently discovered LAN peers |
 | `/chat` | `/chat <target>` | Opens a thread with target (`username`, `user@port`, or `#channel`) |

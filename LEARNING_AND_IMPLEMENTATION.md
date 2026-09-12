@@ -357,6 +357,25 @@ In a decentralized mesh, naive flooding—where every node forwards incoming mes
 In direct 1-to-1 TCP, you can verify the immediate socket connection. In a gossip mesh, Alice's message might reach Charlie through Bob. If Bob were malicious, he could attempt to tamper with Alice's text before forwarding.
 - *The Solution*: Cryptographic origin authentication. The originator signs the message with Ed25519. Any node along the relay path—and the ultimate recipient—verifies the signature against Alice's public key. If Bob alters a single byte, signature verification fails and the packet is immediately dropped.
 
+#### 3. Rich Markup Tag Collision & Sender Attribution Escaping
+- *The Bug*: In group chats, messages were formatted as:
+  `f"[{timestamp}] [bold magenta][{channel} | @{sender}]:[/bold magenta] [white]{text}[/white]"`
+  Because channels start with `#` (e.g., `#general`), Rich's BBCode-style parser interpreted `[#general ...]` as a hexadecimal color code tag (similar to `[#ff00ff]`). Since `#general` is not a valid 6-character hex code, Rich stripped or dropped the entire tag and content within the brackets, resulting in:
+  `[18:00:22] : Awesome!` with the author handle completely missing!
+- *The Fix*:
+  1. Use `rich.markup.escape()` on all dynamic bracket strings and user text:
+     `f"[{timestamp}] [bold magenta]{escape(f'[{channel} | @{sender}]')}:[/bold magenta] [white]{escape(text)}[/white]"`
+  2. Escape all user-supplied message text to ensure brackets typed by users (e.g. `[omg]`) are never stripped.
+  3. Update direct 1-on-1 formatting with `escape(f'[@{sender}]')`.
+
+#### 4. Retroactive Channel Key Unlocking (`/key`)
+- In private channels, peers who arrive or join without immediately passing a passphrase receive encrypted messages and store them with `[🔒 Encrypted message: key required to view]`.
+- We added `/key [channel] <passphrase>`:
+  1. Computes the 256-bit symmetric key via `PBKDF2-HMAC-SHA256`.
+  2. Traverses buffered messages for that channel in `SessionManager`.
+  3. Retroactively decrypts historical messages using PyNaCl `SecretBox`.
+  4. Automatically refreshes the active thread to reveal decrypted text in real time.
+
 ---
 
 ## 7. Next Frontiers: Beyond Phase 3
