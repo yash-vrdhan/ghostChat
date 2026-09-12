@@ -376,6 +376,14 @@ In direct 1-to-1 TCP, you can verify the immediate socket connection. In a gossi
   3. Retroactively decrypts historical messages using PyNaCl `SecretBox`.
   4. Automatically refreshes the active thread to reveal decrypted text in real time.
 
+#### 5. Thread Pane Isolation & Per-Peer Conversation History
+- *The Problem*: Messages from different peers and group channels were all accumulating in a single message pane. Switching threads did not clear the view, and 1-on-1 direct messages were not persisted in a per-peer history. If a message arrived for another channel or peer, it either clobbered the current view or injected notice strings into the middle of the active conversation.
+- *The Fix*:
+  1. **Per-Peer History Tracking**: Added `_peer_messages` in `SessionManager` recording both incoming and outgoing direct messages chronologically with sender identity and timestamp.
+  2. **Clean Pane Switching**: Both `open_chat_thread(peer)` and `open_channel_thread(channel)` now invoke `chat_log.clear()` upon opening and replay only that specific thread's history. Switching threads completely changes the pane.
+  3. **Non-Intrusive Notifications**: Background messages for channels or peers not currently in focus update the sidebar unread counters (`[1]`) and trigger sleek Textual toast notifications (`self.notify()`) instead of polluting the active conversation feed.
+  4. **Clean Exit**: Pressing `Esc` (`action_close_thread`) clears the chat pane and cleanly returns the user to the Welcome Dashboard.
+
 ---
 
 ## 7. Next Frontiers: Beyond Phase 3

@@ -1,5 +1,6 @@
 import base64
 import threading
+import time
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from nacl.secret import SecretBox
@@ -21,6 +22,9 @@ class SessionManager:
         self._active_channel: Optional[str] = None
         self._channel_unread: Dict[str, int] = {}
         self._channel_messages: Dict[str, List[Dict[str, Any]]] = {"#general": []}
+
+        # Peer message history: peer_id -> List[Dict[str, Any]]
+        self._peer_messages: Dict[str, List[Dict[str, Any]]] = {}
 
     @property
     def chat_peer(self) -> Optional[Peer]:
@@ -46,6 +50,23 @@ class SessionManager:
             if peer and peer.peer_id in self._pending_chats:
                 return self._pending_chats.pop(peer.peer_id)
             return None
+
+    def record_outgoing_peer_message(self, peer_id: str, username: str, text: str) -> None:
+        """Record an outgoing message sent to a peer."""
+        with self._lock:
+            if peer_id not in self._peer_messages:
+                self._peer_messages[peer_id] = []
+            self._peer_messages[peer_id].append({
+                "sender": username,
+                "text": text,
+                "timestamp": time.time(),
+                "is_self": True,
+            })
+
+    def get_peer_messages(self, peer_id: str) -> List[Dict[str, Any]]:
+        """Retrieve full conversation history for a peer."""
+        with self._lock:
+            return list(self._peer_messages.get(peer_id, []))
 
     def set_active_channel(self, channel: Optional[str]) -> None:
         """Sets active channel and clears unread badge."""
@@ -172,17 +193,27 @@ class SessionManager:
           - peer: Peer
         """
         with self._lock:
+            sender_name = matched_peer.username if matched_peer else "peer"
+            if sender_peer_id not in self._peer_messages:
+                self._peer_messages[sender_peer_id] = []
+            self._peer_messages[sender_peer_id].append({
+                "sender": sender_name,
+                "text": plaintext,
+                "timestamp": time.time(),
+                "is_self": False,
+            })
+
             # Case 1: In an active thread with this exact sender
             if self._chat_peer and self._chat_peer.peer_id == sender_peer_id:
                 return {"action": "active", "peer": self._chat_peer}
 
-            # Case 2: No active thread -> auto-open thread if peer is known
-            if self._chat_peer is None and matched_peer is not None:
+            # Case 2: No active thread at all (idle on welcome dashboard)
+            if self._chat_peer is None and self._active_channel is None and matched_peer is not None:
                 self._chat_peer = matched_peer
                 self._pending_chats.pop(sender_peer_id, None)
                 return {"action": "auto_opened", "peer": matched_peer}
 
-            # Case 3: In an active thread with someone else -> buffer as pending
+            # Case 3: In an active thread with someone else or in a channel -> buffer as pending
             if matched_peer is not None:
                 if sender_peer_id in self._pending_chats:
                     self._pending_chats[sender_peer_id]["unread"] += 1
@@ -200,6 +231,7 @@ class SessionManager:
                     "peer": matched_peer,
                     "unread_count": unread,
                     "active_peer": self._chat_peer,
+                    "active_channel": self._active_channel,
                 }
 
             return {"action": "untracked"}
