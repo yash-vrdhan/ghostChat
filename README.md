@@ -22,6 +22,13 @@ It uses peer discovery, persistent peer-to-peer TCP sessions, length-prefixed pr
   - Length-prefixed binary framing (`[4-byte uint32 length][payload]`) with a 64 KB DoS guard
   - Delivery ACK feedback with timeout handling
   - Duplicate message suppression by `message_id`
+- **Modern Graphical TUI (Claude Code / Gemini CLI Aesthetic)**:
+  - Built with [Textual](https://textual.textualize.io/) featuring custom developer dark styling, neon cyan highlights, and violet accents
+  - Custom ASCII Ghost logo and cryptographic identity dashboard
+  - Dedicated left sidebar for discovered peers with real-time online indicators and unread badges
+  - Isolated bottom input dock that completely eliminates prompt clobbering from background network events
+  - Seamless view transition between Welcome Dashboard and Active Conversation feeds
+  - Dual launch mode: opens full graphical TUI by default; `--cli` flag available for classic line mode
 - **Terminal UI & Session State**:
   - Interactive chat thread mode with unread background message buffering
   - Dynamic pending chat switching (`/chat switch`)
@@ -113,7 +120,7 @@ Run the full automated test suite:
 poetry run pytest -v
 ```
 
-18 automated unit and integration tests cover:
+21 automated unit, integration, and TUI tests cover:
 - Cryptographic encryption/decryption round-trips
 - Signature verification and tamper detection
 - Signed discovery beacon generation and spoof rejection
@@ -122,6 +129,7 @@ poetry run pytest -v
 - Length-prefixed framing codec round-trips and oversized packet rejection
 - TCP transport delivery, ACKs, connection reuse, and deduplication
 - Media chunking, optimization, reconstruction, and ASCII rendering pipeline
+- Textual TUI mounting, sidebar peer rendering, and view switching
 
 ---
 

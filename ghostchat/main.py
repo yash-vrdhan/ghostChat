@@ -6,7 +6,7 @@ import socket
 import tempfile
 import threading
 import uuid
-from typing import Optional
+from typing import Callable, Dict, List, Optional
 
 from rich.console import Console
 
@@ -25,6 +25,7 @@ from ghostchat.network.discovery import DiscoveryService, Peer
 from ghostchat.network.transport import TransportService
 from ghostchat.protocol.packets import MessagePacket
 from ghostchat.session.manager import SessionManager
+from ghostchat.ui.banner import get_styled_logo_text
 from ghostchat.ui.terminal import TerminalUI
 
 
@@ -32,6 +33,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="GhostChat: P2P Encrypted Terminal Messenger")
     parser.add_argument("--username", required=True, help="Your display name")
     parser.add_argument("--port", type=int, default=5000, help="TCP listen port")
+    parser.add_argument(
+        "--cli",
+        action="store_true",
+        help="Launch in classic command-line mode instead of the graphical split-pane TUI",
+    )
     return parser.parse_args()
 
 
@@ -54,6 +60,12 @@ class GhostChatApp:
         self.encoder = MediaEncoder()
         self.decoder = MediaDecoder(str(self.media_dir))
 
+        self.ui_listeners: Dict[str, List[Callable]] = {
+            "peer_change": [],
+            "message": [],
+            "media": [],
+        }
+
         self.discovery = DiscoveryService(
             peer_id=self.peer_id,
             username=self.username,
@@ -62,12 +74,35 @@ class GhostChatApp:
             sign_public_key_b64=self.keys.sign_public_b64,
             sign_private=self.keys.sign_private,
             known_hosts=self.known_hosts,
+            on_peer_change=self._notify_peer_change,
         )
         self.transport = TransportService(
             local_peer_id=self.peer_id,
             listen_port=self.port,
             on_message=self.on_message,
         )
+
+    def register_ui_listener(self, event_type: str, callback: Callable) -> None:
+        if event_type in self.ui_listeners:
+            self.ui_listeners[event_type].append(callback)
+
+    def _notify_peer_change(self) -> None:
+        for cb in self.ui_listeners.get("peer_change", []):
+            try:
+                cb()
+            except Exception:
+                pass
+
+    def start_services(self) -> None:
+        self.discovery.start()
+        self.transport.start()
+
+    def stop_services(self) -> None:
+        self.discovery.stop()
+        self.transport.stop()
+
+    def encoder_renderer_helper(self, filepath: str) -> str:
+        return self.decoder.ascii_renderer.get_ascii_from_path(filepath)
 
     def verify_port_available(self) -> bool:
         probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -135,6 +170,17 @@ class GhostChatApp:
         matched_peer = next((p for p in self.discovery.peers() if p.peer_id == msg.sender_peer_id), None)
         routing = self.session.record_incoming_message(msg.sender_peer_id, matched_peer, plaintext)
 
+        # Notify TUI listeners if active
+        listeners = self.ui_listeners.get("message", [])
+        if listeners:
+            for cb in listeners:
+                try:
+                    cb(msg.sender, plaintext, msg.sender_peer_id, routing)
+                except Exception:
+                    pass
+            return
+
+        # CLI fallback rendering
         with self.lock:
             if routing["action"] == "active":
                 self.console.print(f"[bold cyan][chat:{msg.sender}][/bold cyan] [white]{plaintext}[/white]")
@@ -187,16 +233,24 @@ class GhostChatApp:
             sender_peer_id, msg_id, chunk_index, total_chunks, chunk, media_type, filename
         )
         if complete_file:
-            with self.lock:
-                self.console.print(
-                    f"[cyan]INFO[/cyan] Received {media_type} '{filename}' from {sender}. Rendering..."
-                )
-
-            def render() -> None:
+            listeners = self.ui_listeners.get("media", [])
+            if listeners:
+                for cb in listeners:
+                    try:
+                        cb(complete_file, media_type, sender)
+                    except Exception:
+                        pass
+            else:
                 with self.lock:
-                    self.decoder.render_media(complete_file, media_type)
+                    self.console.print(
+                        f"[cyan]INFO[/cyan] Received {media_type} '{filename}' from {sender}. Rendering..."
+                    )
 
-            threading.Thread(target=render, daemon=True).start()
+                def render() -> None:
+                    with self.lock:
+                        self.decoder.render_media(complete_file, media_type)
+
+                threading.Thread(target=render, daemon=True).start()
 
         missing = self.decoder.chunk_manager.get_missing_chunks(sender_peer_id, msg_id)
         if missing and chunk_index == total_chunks - 1:
@@ -266,7 +320,7 @@ class GhostChatApp:
                 self.console.print(f"[red]Error sending media: {e}[/red]")
             return False
 
-    def send_encrypted_message(self, target: Peer, text: str) -> bool:
+    def send_encrypted_message(self, target: Peer, text: str, quiet: bool = False) -> bool:
         try:
             recipient_public = parse_public_key_b64(target.enc_public_key_b64)
             signature = sign_message(self.keys.sign_private, text)
@@ -288,19 +342,21 @@ class GhostChatApp:
                 packet.to_dict(),
                 wait_for_ack=True,
             )
-            with self.lock:
-                if success:
-                    self.console.print(
-                        f"[cyan]INFO[/cyan] Encrypted message sent and ACKed by {target.username} ({target.ip}:{target.tcp_port})"
-                    )
-                else:
-                    self.console.print(
-                        f"[yellow]WARN[/yellow] Message sent to {target.username} but no ACK received."
-                    )
+            if not quiet:
+                with self.lock:
+                    if success:
+                        self.console.print(
+                            f"[cyan]INFO[/cyan] Encrypted message sent and ACKed by {target.username} ({target.ip}:{target.tcp_port})"
+                        )
+                    else:
+                        self.console.print(
+                            f"[yellow]WARN[/yellow] Message sent to {target.username} but no ACK received."
+                        )
             return success
         except OSError as exc:
-            with self.lock:
-                self.console.print(f"[yellow]WARN[/yellow] Send failed: {exc}")
+            if not quiet:
+                with self.lock:
+                    self.console.print(f"[yellow]WARN[/yellow] Send failed: {exc}")
             return False
 
     def pick_peer_interactive(self) -> Optional[Peer]:
@@ -380,16 +436,16 @@ class GhostChatApp:
             return
         self.start_chat_thread(resolved)
 
-    def run(self) -> None:
+    def run_cli(self) -> None:
         if not self.verify_port_available():
             return
 
-        self.discovery.start()
-        self.transport.start()
+        self.start_services()
 
         try:
             with self.lock:
-                self.console.print("[cyan]INFO[/cyan] GhostChat started (v0.2.0 Hardened)")
+                self.console.print(get_styled_logo_text())
+                self.console.print("[cyan]INFO[/cyan] GhostChat started (v0.2.0 Hardened CLI Mode)")
                 self.console.print(f"[cyan]INFO[/cyan] peer_id={self.peer_id}")
                 self.console.print(f"[cyan]INFO[/cyan] fingerprint={self.keys.fingerprint}")
                 self.console.print("[cyan]INFO[/cyan] Signed discovery, length-prefixed framing & TOFU active")
@@ -564,15 +620,20 @@ class GhostChatApp:
         except (KeyboardInterrupt, EOFError):
             pass
         finally:
-            self.discovery.stop()
-            self.transport.stop()
+            self.stop_services()
             self.console.print("Goodbye.")
 
 
 def main() -> None:
     args = parse_args()
     app = GhostChatApp(username=args.username, port=args.port)
-    app.run()
+    if args.cli:
+        app.run_cli()
+    else:
+        from ghostchat.ui.app import GhostChatTUIApp
+
+        tui = GhostChatTUIApp(backend=app)
+        tui.run()
 
 
 if __name__ == "__main__":

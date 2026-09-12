@@ -3,7 +3,7 @@ import socket
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from nacl.signing import SigningKey
 
@@ -41,6 +41,7 @@ class DiscoveryService:
         sign_public_key_b64: str,
         sign_private: Optional[SigningKey] = None,
         known_hosts: Optional[KnownHostsManager] = None,
+        on_peer_change: Optional[Callable[[], None]] = None,
     ) -> None:
         self.peer_id = peer_id
         self.username = username
@@ -49,6 +50,7 @@ class DiscoveryService:
         self.sign_public_key_b64 = sign_public_key_b64
         self.sign_private = sign_private
         self.known_hosts = known_hosts
+        self.on_peer_change = on_peer_change
 
         self._stop_event = threading.Event()
         self._peers: Dict[str, Peer] = {}
@@ -164,6 +166,12 @@ class DiscoveryService:
             with self._lock:
                 self._peers[packet.peer_id] = peer
 
+            if self.on_peer_change:
+                try:
+                    self.on_peer_change()
+                except Exception:
+                    pass
+
         sock.close()
 
     def _cleanup_loop(self) -> None:
@@ -173,4 +181,9 @@ class DiscoveryService:
                 stale = [pid for pid, peer in self._peers.items() if peer.last_seen < cutoff]
                 for pid in stale:
                     del self._peers[pid]
+            if stale and self.on_peer_change:
+                try:
+                    self.on_peer_change()
+                except Exception:
+                    pass
             time.sleep(1)

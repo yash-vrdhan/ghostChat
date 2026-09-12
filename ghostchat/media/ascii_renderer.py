@@ -34,9 +34,17 @@ class ASCIIRenderer:
         ascii_text = self.image_to_ascii(img, width)
         self.console.print(Text(ascii_text))
 
+    def get_ascii_from_path(self, filepath: str, width: int = 60) -> str:
+        try:
+            img = Image.open(filepath)
+            return self.image_to_ascii(img, width)
+        except Exception as e:
+            return f"[Error rendering image: {e}]"
+
     def render_from_path(self, filepath: str, width: int = 80):
         try:
             img = Image.open(filepath)
             self.render_image(img, width)
         except Exception as e:
             self.console.print(f"[red]Error rendering image: {e}[/red]")
+

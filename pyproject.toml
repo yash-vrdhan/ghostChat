@@ -7,13 +7,14 @@ name = "ghostchat"
 version = "0.2.0"
 description = "Distributed end-to-end encrypted terminal messaging (learning project)"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<4.0"
 dependencies = [
   "PyNaCl>=1.5.0",
   "rich>=13.7.0",
   "pytest (>=9.0.3,<10.0.0)",
   "Pillow>=10.0.0",
   "numpy>=1.25.0",
+  "textual (>=8.2.8,<9.0.0)",
 ]
 
 [project.optional-dependencies]
