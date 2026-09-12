@@ -4,6 +4,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
@@ -113,7 +114,7 @@ class GhostChatTUIApp(App):
     }
 
     #content-area {
-        height: 1fr;
+        height: 100%;
         width: 1fr;
         background: #11111b;
     }
@@ -142,22 +143,23 @@ class GhostChatTUIApp(App):
         display: none;
     }
 
-    #input-dock {
-        height: 3;
-        dock: bottom;
+    #input-container {
+        height: 4;
         background: #181825;
         border-top: solid #313244;
         padding: 0 1;
     }
 
     #message-input {
+        height: 3;
+        border: round #89b4fa;
         background: #1e1e2e;
-        border: tall #313244;
-        color: #cdd6f4;
+        color: #ffffff;
     }
 
     #message-input:focus {
-        border: tall #00f0ff;
+        border: round #00f0ff;
+        background: #181825;
     }
     """
 
@@ -166,6 +168,14 @@ class GhostChatTUIApp(App):
         self.backend = backend
         self.active_peer: Optional[Peer] = None
         self._refresh_timer = None
+
+    async def on_event(self, event: events.Event) -> None:
+        try:
+            await super().on_event(event)
+        except AttributeError as exc:
+            if "object has no attribute 'region'" in str(exc):
+                return
+            raise
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -193,12 +203,12 @@ class GhostChatTUIApp(App):
                         )
                     )
                 yield RichLog(id="chat-log", markup=True, wrap=True, highlight=False)
+                with Container(id="input-container"):
+                    yield Input(
+                        placeholder="Type a message or /command... (Esc to unselect, /help for manual)",
+                        id="message-input",
+                    )
 
-        with Horizontal(id="input-dock"):
-            yield Input(
-                placeholder="Type a message or /command... (Esc to unselect, /help for manual)",
-                id="message-input",
-            )
         yield Footer()
 
     def on_mount(self) -> None:

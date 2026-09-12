@@ -79,3 +79,30 @@ def test_tui_thread_open_and_close(tmp_path, monkeypatch) -> None:
             assert tui_app.query_one("#chat-log", RichLog).styles.display == "none"
 
     asyncio.run(run())
+
+
+def test_tui_input_visibility_and_command(tmp_path, monkeypatch) -> None:
+    async def run() -> None:
+        monkeypatch.setattr("ghostchat.crypto.keys.KEY_ROOT_DIR", tmp_path)
+        backend = GhostChatApp(username="test_alice", port=59993)
+        tui_app = GhostChatTUIApp(backend=backend)
+
+        async with tui_app.run_test(size=(100, 30)) as pilot:
+            inp_container = tui_app.query_one("#input-container")
+            msg_input = tui_app.query_one("#message-input", Input)
+            assert inp_container is not None
+            assert msg_input is not None
+            # Check container geometry
+            assert inp_container.region.height == 4
+            assert msg_input.region.height == 3
+
+            # Submit /help command
+            msg_input.value = "/help"
+            await pilot.press("enter")
+
+            # Chat log should now be visible and contain help info
+            assert tui_app.query_one("#welcome-container").styles.display == "none"
+            chat_log = tui_app.query_one("#chat-log", RichLog)
+            assert chat_log.styles.display == "block"
+
+    asyncio.run(run())

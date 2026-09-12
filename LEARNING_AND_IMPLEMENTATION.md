@@ -293,15 +293,45 @@ Encrypting a message (`Box.encrypt`) keeps the contents confidential, but it doe
 
 ---
 
-## 5. Next Frontiers: Beyond Phase 1
+## 5. Phase 2: Modern Developer-First Graphical TUI & Architecture
 
-With the foundations hardened and the architecture decoupled, GhostChat is primed for its next major milestones:
+### What Was Built
+A developer-first Terminal User Interface inspired by Claude Code and Gemini CLI:
+1. **ASCII Art Brand Silhouette & Status Dashboard**:
+   - Dynamic ghost logo with glowing cyan/violet gradients.
+   - Node identity card featuring local username, port, and SHA-256 public key fingerprint.
+   - Live network statistics and active key pinning status.
+2. **Split-Pane Reactive Layout (Textual)**:
+   - Left sidebar (`#sidebar`, width: 32) displaying active LAN ghosts, online status dots, and unread notification badges.
+   - Main content area (`#content-area`) featuring a dynamic header, initial welcome dashboard, and active thread `RichLog`.
+   - Dedicated unclipped bottom message input container with glowing focus borders (`#89b4fa` -> `#00f0ff`).
+3. **Dual-Mode Launcher**:
+   - `ghostchat` launches the graphical TUI by default.
+   - `ghostchat --cli` provides backward compatibility for headless environments or minimal shells.
 
-1. **Modern Split-Pane TUI (Terminal User Interface)**:
-   - Implement `Textual` or `prompt_toolkit` to create a dedicated sidebar for active peers, a scrollable chat thread history pane, and an isolated bottom input bar.
-2. **Forward Secrecy (The Double Ratchet Algorithm)**:
+### Critical Frontend & TUI Systems Lessons Learned
+
+#### 1. Docking Collisions in Terminal Screen Calculations
+When building terminal UIs with bottom bars (like input docks and footers):
+- Textual's `Footer` has `dock: bottom; height: 1;` by default.
+- If an `#input-dock` also uses `dock: bottom; height: 3;` with `border-top: solid`, Textual calculates geometry relative to the screen bounds. If the terminal height is tight, the input box gets clobbered or pushed off-screen.
+- **The Fix**: Rather than docking the input to the root `Screen`, we nest `#input-container` (`height: 4`) directly inside `#content-area` (`height: 100%`) alongside `#chat-header` (`height: 3`) and `#chat-log` / `#welcome-container` (`height: 1fr`). This gives the input container guaranteed dedicated geometry with zero overlap.
+
+#### 2. Async Event Pumps vs. Sync Dispatch Handlers
+In Textual's internal event loop:
+- `App.on_event` is an asynchronous coroutine method (`async def on_event(self, event: events.Event) -> None:`).
+- Implementing a synchronous `def on_event` causes the internal message pump to raise `TypeError: object NoneType can't be used in 'await' expression`.
+- Defensively catching non-container mouse selection exceptions (`AttributeError: 'NoneType' object has no attribute 'region'`) must be done inside an awaited async handler.
+
+---
+
+## 6. Next Frontiers: Beyond Phase 2
+
+With the foundations hardened and the graphical TUI running smoothly, GhostChat is primed for its next major milestones:
+
+1. **Forward Secrecy (The Double Ratchet Algorithm)**:
    - Currently, if a user's static private key is compromised, all past intercepted ciphertexts can be decrypted. Upgrading to the Signal Double Ratchet algorithm will rotate ephemeral keys per message, ensuring past communications remain secure even if future keys are leaked.
-3. **Encrypted File & Code Snippet Transfer**:
+2. **Encrypted File & Code Snippet Transfer**:
    - Stream files in encrypted 32 KB chunks with SHA-256 integrity verification and Rich terminal progress bars.
-4. **Decentralized AI Agent Fabric**:
+3. **Decentralized AI Agent Fabric**:
    - Turn GhostChat into an autonomous agent communication network, allowing local LLM agents to securely discover peers, negotiate tasks, and collaborate peer-to-peer using standard JSON-RPC / MCP framing.
