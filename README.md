@@ -64,12 +64,14 @@ Both nodes will automatically discover each other via LAN UDP broadcast (`:54545
   - Built with [Textual](https://textual.textualize.io/) featuring custom developer dark styling, neon cyan highlights, and violet accents
   - Custom ASCII Ghost logo and cryptographic identity dashboard
   - Dedicated left sidebar for group channels and active peers with real-time online indicators and unread badges
+  - **Isolated Dedicated Conversation Panes**: Switching between channels and peers automatically clears the active pane and replays that conversation's complete chronological history, preventing cross-thread confusion
+  - **Non-Intrusive Toast Notifications**: Incoming messages for background threads trigger sleek toast notifications and update sidebar unread badges without polluting the active conversation feed
   - Isolated bottom input dock that completely eliminates prompt clobbering from background network events
   - Seamless view transition between Welcome Dashboard and Active Conversation feeds
   - Dual launch mode: opens full graphical TUI by default; `--cli` flag available for classic line mode
 - **Terminal UI & Session State**:
-  - Interactive chat thread mode with unread background message buffering
-  - Dynamic pending chat switching (`/chat switch`)
+  - Interactive chat thread mode with persistent per-peer and per-channel conversation history
+  - Dynamic pending chat switching (`/chat <target>` or sidebar selection)
   - Ambiguity resolution for duplicate usernames (`user@port`, `ip:port`, interactive numbered picker)
 - **Encrypted Media Transfer & ASCII Rendering**:
   - Encrypted image (`/sendimg`) and animated GIF (`/sendgif`) transfer
@@ -128,24 +130,26 @@ poetry run ghostchat --username alice --port 5001
 - `/sendimg <target> <path>` — send an image with automatic terminal ASCII rendering
 - `/sendgif <target> <path>` — send an animated GIF with terminal animation rendering
 
-### Chat Thread Mode
-- `/chat` — interactive recipient picker to open a dedicated thread
-- `/chat <target>` — open thread directly (`username`, `username@port`, or `ip:port`)
-- `/chat-thread` — alias of `/chat`
-- `/chat pending` — list pending unread chats with counts
-- `/chat switch` — switch to pending chat via interactive picker
-- `/chat switch <target>` — switch directly to a pending chat
-- `/exit` — close active chat thread
+### Group Channels (Decentralized Gossip Mesh)
+- `/channels` — list all subscribed group channels and active member counts
+- `/join <#channel> [passkey]` — join or create a decentralized channel (optional end-to-end encryption)
+- `/key [channel] <passkey>` — set or unlock channel encryption key (auto-decrypts historical messages)
+- `/leave <#channel>` — leave a group channel
 
-While a thread is active, any plain text entered sends directly to that peer with sign + encrypt + length-prefixed framing + delivery ACK. You can also send `/sendimg <path>` or `/sendgif <path>` directly to the active peer.
+### Chat Thread Mode
+- `/chat` — show usage or open dedicated thread
+- `/chat <target>` — open thread directly (`username`, `username@port`, `ip:port`, or `#channel`)
+- `/exit` — close active chat thread and return cleanly to Dashboard
+
+While a thread is active, any plain text entered sends directly to that thread with sign + encrypt + length-prefixed framing + delivery ACK. You can also send `/sendimg <path>` or `/sendgif <path>` directly to the active peer.
 
 ---
 
 ## Security Model
 
-- **Confidentiality**: All message payloads encrypted end-to-end using Curve25519 authenticated encryption.
-- **Authenticity & Integrity**: Ed25519 digital signatures verified on every message, file chunk, and discovery broadcast.
-- **Replay & DoS Mitigation**: Duplicate `message_id` suppression and strict 64 KB maximum packet size limits over length-prefixed TCP frames.
+- **Confidentiality**: All message payloads encrypted end-to-end using Curve25519 (direct 1-on-1) or XSalsa20-Poly1305 `SecretBox` (keyed channels).
+- **Authenticity & Integrity**: Ed25519 digital signatures verified on every message, file chunk, discovery broadcast, and gossip packet.
+- **Replay & DoS Mitigation**: Duplicate `message_id` suppression, LRU Seen Caching, and strict 64 KB maximum packet size limits over length-prefixed TCP frames.
 - **Identity Pinning (TOFU)**: Public keys are pinned upon first contact in `~/.ghostchat/<profile>/known_hosts.json`. Any unannounced key changes trigger explicit security alerts.
 - **At-Rest Protection**: Secret key files are locked to `0600` (`-rw-------`) and directories to `0700` (`drwx------`).
 
@@ -158,7 +162,7 @@ Run the full automated test suite:
 poetry run pytest -v
 ```
 
-21 automated unit, integration, and TUI tests cover:
+31 automated unit, integration, and TUI tests cover:
 - Cryptographic encryption/decryption round-trips
 - Signature verification and tamper detection
 - Signed discovery beacon generation and spoof rejection

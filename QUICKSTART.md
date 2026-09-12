@@ -85,6 +85,8 @@ The interface will smoothly switch from the Welcome Dashboard to the **Conversat
 
 ### Chat Features at a Glance:
 - **Header Status**: Displays `Chatting with @bob (192.168.1.42:5002) • ● TOFU Verified`.
+- **Isolated Thread Panes**: Switching threads automatically clears the conversation pane and replays that thread's complete chronological history. Conversations with different peers and channels are never mixed together.
+- **Non-Intrusive Notifications**: If someone sends a message in another channel or peer thread while you are chatting, your active view is never clobbered. A floating toast notification appears and the sidebar badge updates (e.g. `[1]`).
 - **End-to-End Encryption**: Every message is authenticated and encrypted via Curve25519 (`PyNaCl Box`) using length-prefixed binary framing.
 - **Delivery Confirmations**: Each message displays a cyan delivery receipt upon receiving an encrypted TCP ACK packet:
   ```text
