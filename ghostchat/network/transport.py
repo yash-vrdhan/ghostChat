@@ -2,7 +2,9 @@ import json
 import socket
 import threading
 import uuid
-from typing import Callable, Dict, Set, Optional, Tuple
+from typing import Callable, Dict, Optional, Set, Tuple
+
+from ghostchat.protocol.packets import FramingCodec
 
 
 MessageHandler = Callable[[dict], None]
@@ -83,11 +85,12 @@ class TransportService:
                     self.pending_acks.pop((peer_id, msg_id), None)
             return False
 
-        data = json.dumps(packet).encode("utf-8") + b"\n"
         try:
+            payload_bytes = json.dumps(packet).encode("utf-8")
+            framed_data = FramingCodec.encode_frame(payload_bytes)
             with write_lock:
-                sock.sendall(data)
-        except OSError:
+                sock.sendall(framed_data)
+        except (OSError, ValueError):
             self._remove_peer(peer_id, sock)
             if ack_event:
                 with self.acks_lock:
@@ -132,20 +135,27 @@ class TransportService:
 
             threading.Thread(target=self._handle_conn, args=(conn,), daemon=True).start()
 
+        server.close()
+
     def _handle_conn(self, conn: socket.socket, identified_peer_id: Optional[str] = None) -> None:
         peer_id = identified_peer_id
         local_write_lock: Optional[threading.Lock] = None
         if identified_peer_id is not None:
             with self.peers_lock:
                 local_write_lock = self.write_locks.get(identified_peer_id)
+
         try:
-            f = conn.makefile("rb")
             while not self._stop_event.is_set():
-                line = f.readline()
-                if not line:
-                    break
                 try:
-                    packet = json.loads(line.decode("utf-8"))
+                    payload_bytes = FramingCodec.read_frame(conn)
+                except (ConnectionError, OSError):
+                    break
+                except ValueError:
+                    # Frame exceeded max allowed packet size: drop and disconnect
+                    break
+
+                try:
+                    packet = json.loads(payload_bytes.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     continue
 
@@ -155,15 +165,13 @@ class TransportService:
                         peer_id = sender_peer_id
                         with self.peers_lock:
                             if peer_id in self.peers:
-                                # Keep canonical mapping stable and use a local lock for this connection.
                                 local_write_lock = self.write_locks[peer_id]
                             else:
                                 self.peers[peer_id] = conn
                                 local_write_lock = threading.Lock()
                                 self.write_locks[peer_id] = local_write_lock
                     elif peer_id != sender_peer_id:
-                        # Malicious/buggy peer claiming different peer_id
-                        # Ignore this packet and possibly close connection
+                        # Peer attempting to spoof sender identity on existing connection
                         continue
 
                 msg_type = packet.get("type")
@@ -194,15 +202,16 @@ class TransportService:
                         continue
 
                 self.on_message(packet)
-        except OSError:
-            pass
         finally:
             if peer_id:
                 with self.peers_lock:
                     if self.peers.get(peer_id) == conn:
                         del self.peers[peer_id]
                         del self.write_locks[peer_id]
-            conn.close()
+            try:
+                conn.close()
+            except OSError:
+                pass
 
     def _send_ack(
         self,
@@ -222,11 +231,11 @@ class TransportService:
         ack = {
             "type": "ACK",
             "message_id": message_id,
-            "sender_peer_id": self.local_peer_id
+            "sender_peer_id": self.local_peer_id,
         }
         try:
-            data = json.dumps(ack).encode("utf-8") + b"\n"
+            framed_data = FramingCodec.encode_frame(json.dumps(ack).encode("utf-8"))
             with write_lock:
-                conn.sendall(data)
-        except OSError:
+                conn.sendall(framed_data)
+        except (OSError, ValueError):
             pass

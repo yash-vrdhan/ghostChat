@@ -1,278 +1,233 @@
 import argparse
+import base64
+import os
 import secrets
 import socket
+import tempfile
 import threading
+import uuid
+from typing import Optional
 
 from rich.console import Console
 
 from ghostchat.crypto.encrypt import decrypt_message, encrypt_message
 from ghostchat.crypto.keys import (
+    get_key_dir,
     load_or_create_keys,
     parse_public_key_b64,
     parse_verify_key_b64,
 )
+from ghostchat.crypto.known_hosts import KnownHostsManager
 from ghostchat.crypto.signing import sign_message, verify_signature
-from ghostchat.media.encoder import MediaEncoder
 from ghostchat.media.decoder import MediaDecoder
-from ghostchat.network.discovery import DiscoveryService
+from ghostchat.media.encoder import MediaEncoder
+from ghostchat.network.discovery import DiscoveryService, Peer
 from ghostchat.network.transport import TransportService
+from ghostchat.protocol.packets import MessagePacket
+from ghostchat.session.manager import SessionManager
 from ghostchat.ui.terminal import TerminalUI
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="GhostChat (learning scaffold)")
+    parser = argparse.ArgumentParser(description="GhostChat: P2P Encrypted Terminal Messenger")
     parser.add_argument("--username", required=True, help="Your display name")
     parser.add_argument("--port", type=int, default=5000, help="TCP listen port")
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-    peer_id = secrets.token_hex(8)
-    keys = load_or_create_keys(profile=args.username)
-    console = Console()
-    ui = TerminalUI(username=args.username, fingerprint=keys.fingerprint, port=args.port)
-    lock = threading.RLock()
-    state = {"chat_peer": None, "pending_chats": {}}
+class GhostChatApp:
+    def __init__(self, username: str, port: int) -> None:
+        self.username = username
+        self.port = port
+        self.peer_id = secrets.token_hex(8)
+        self.console = Console()
+        self.lock = threading.RLock()
 
-    media_storage = os.path.expanduser(f"~/.ghostchat/{args.username}/media")
-    encoder = MediaEncoder()
-    decoder = MediaDecoder(media_storage)
+        self.key_dir = get_key_dir(self.username)
+        self.keys = load_or_create_keys(profile=self.username)
+        self.known_hosts = KnownHostsManager(self.key_dir)
+        self.session = SessionManager()
+        self.ui = TerminalUI(username=self.username, fingerprint=self.keys.fingerprint, port=self.port)
 
-    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        probe.bind(("", args.port))
-    except OSError as exc:
-        console.print(f"[red]Cannot start GhostChat on port {args.port}: {exc}[/red]")
-        console.print("Try a different --port (example: 5001, 5002, ...).")
-        return
-    finally:
-        probe.close()
+        self.media_dir = self.key_dir / "media"
+        self.media_dir.mkdir(parents=True, exist_ok=True)
+        self.encoder = MediaEncoder()
+        self.decoder = MediaDecoder(str(self.media_dir))
 
-    def render_dashboard() -> None:
-        with lock:
-            console.print(ui.dashboard(discovery.peers()))
+        self.discovery = DiscoveryService(
+            peer_id=self.peer_id,
+            username=self.username,
+            tcp_port=self.port,
+            enc_public_key_b64=self.keys.enc_public_b64,
+            sign_public_key_b64=self.keys.sign_public_b64,
+            sign_private=self.keys.sign_private,
+            known_hosts=self.known_hosts,
+        )
+        self.transport = TransportService(
+            local_peer_id=self.peer_id,
+            listen_port=self.port,
+            on_message=self.on_message,
+        )
 
-    def on_message(packet: dict) -> None:
+    def verify_port_available(self) -> bool:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind(("", self.port))
+            return True
+        except OSError as exc:
+            self.console.print(f"[red]Cannot start GhostChat on port {self.port}: {exc}[/red]")
+            self.console.print("Try a different --port (e.g. 5001, 5002, ...).")
+            return False
+        finally:
+            probe.close()
+
+    def on_message(self, packet: dict) -> None:
         msg_type = packet.get("type")
-        if msg_type not in ["MESSAGE", "IMAGE", "GIF", "FILE_CHUNK", "FILE_COMPLETE", "RETRANSMIT_REQUEST"]:
+
+        if msg_type == "FILE_CHUNK":
+            self._handle_file_chunk(packet)
             return
 
+        if msg_type == "RETRANSMIT_REQUEST":
+            sender = packet.get("sender", "unknown")
+            with self.lock:
+                self.console.print(
+                    f"[yellow]INFO[/yellow] Received retransmit request from {sender} for {packet.get('message_id')}"
+                )
+            return
+
+        if msg_type != "MESSAGE":
+            return
+
+        msg = MessagePacket.from_dict(packet)
+        if not all([msg.sender_enc_public_key, msg.sender_sign_public_key, msg.ciphertext, msg.signature]):
+            with self.lock:
+                self.console.print("[yellow]WARN[/yellow] Dropped malformed encrypted packet")
+            return
+
+        try:
+            sender_enc_public = parse_public_key_b64(msg.sender_enc_public_key)
+            plaintext = decrypt_message(self.keys.enc_private, sender_enc_public, msg.ciphertext)
+            sender_verify_key = parse_verify_key_b64(msg.sender_sign_public_key)
+            valid = verify_signature(sender_verify_key, plaintext, msg.signature)
+        except Exception as exc:
+            with self.lock:
+                self.console.print(f"[yellow]WARN[/yellow] Failed to decrypt/verify: {exc}")
+            return
+
+        if not valid:
+            with self.lock:
+                self.console.print(f"[yellow]WARN[/yellow] Signature verification failed for sender {msg.sender}")
+            return
+
+        # TOFU key check
+        trusted, warning = self.known_hosts.check_or_pin(
+            peer_id=msg.sender_peer_id,
+            username=msg.sender,
+            enc_public_key=msg.sender_enc_public_key,
+            sign_public_key=msg.sender_sign_public_key,
+        )
+        if not trusted and warning:
+            with self.lock:
+                self.console.print(f"[red bold]{warning}[/red bold]")
+
+        matched_peer = next((p for p in self.discovery.peers() if p.peer_id == msg.sender_peer_id), None)
+        routing = self.session.record_incoming_message(msg.sender_peer_id, matched_peer, plaintext)
+
+        with self.lock:
+            if routing["action"] == "active":
+                self.console.print(f"[bold cyan][chat:{msg.sender}][/bold cyan] [white]{plaintext}[/white]")
+            elif routing["action"] == "auto_opened":
+                self.console.print(f"[bold green]{msg.sender}[/bold green] [white]{plaintext}[/white]")
+                peer = routing["peer"]
+                self.console.print(
+                    f"[cyan]INFO[/cyan] Auto-opened chat thread with {peer.username} ({peer.ip}:{peer.tcp_port}). "
+                    "Type reply directly or /exit."
+                )
+            elif routing["action"] == "queued":
+                self.console.print(f"[bold green]{msg.sender}[/bold green] [white]{plaintext}[/white]")
+                peer = routing["peer"]
+                active = routing["active_peer"]
+                unread = routing["unread_count"]
+                self.console.print(
+                    f"[yellow]INFO[/yellow] New message from {peer.username} ({peer.ip}:{peer.tcp_port}) "
+                    f"while active chat is {active.username}. unread={unread}. Use '/chat switch' to switch."
+                )
+            else:
+                self.console.print(f"[bold green]{msg.sender}[/bold green] [white]{plaintext}[/white]")
+
+    def _handle_file_chunk(self, packet: dict) -> None:
         sender = packet.get("sender", "unknown")
-        sender_peer_id = packet.get("sender_peer_id")
+        sender_peer_id = packet.get("sender_peer_id", "")
         sender_enc_public_b64 = packet.get("sender_enc_public_key")
         sender_sign_public_b64 = packet.get("sender_sign_public_key")
         ciphertext = packet.get("ciphertext")
         signature = packet.get("signature")
+        chunk_index = packet.get("chunk_index", 0)
+        total_chunks = packet.get("total_chunks", 1)
+        filename = packet.get("filename", "unknown")
+        media_type = packet.get("media_type", "IMAGE")
+        msg_id = packet.get("message_id")
 
         if not all([sender_enc_public_b64, sender_sign_public_b64, ciphertext, signature]):
-            with lock:
-                console.print("[yellow]WARN[/yellow] Dropped malformed encrypted packet")
             return
 
         try:
             sender_enc_public = parse_public_key_b64(sender_enc_public_b64)
-            plaintext = decrypt_message(keys.enc_private, sender_enc_public, ciphertext)
+            chunk_b64 = decrypt_message(self.keys.enc_private, sender_enc_public, ciphertext)
             sender_verify_key = parse_verify_key_b64(sender_sign_public_b64)
-            valid = verify_signature(sender_verify_key, plaintext, signature)
-        except Exception as exc:
-            with lock:
-                console.print(f"[yellow]WARN[/yellow] Failed to decrypt/verify: {exc}")
+            if not verify_signature(sender_verify_key, chunk_b64, signature):
+                return
+            chunk = base64.b64decode(chunk_b64)
+        except Exception:
             return
 
-        if not valid:
-            with lock:
-                console.print(
-                    f"[yellow]WARN[/yellow] Signature verification failed for sender {sender}"
-                )
-            return
-
-        if msg_type == "FILE_CHUNK":
-            import base64
-            chunk_data = base64.b64decode(plaintext)
-            chunk_index = packet.get("chunk_index")
-            total_chunks = packet.get("total_chunks")
-            media_type = packet.get("media_type")
-            filename = packet.get("filename")
-            msg_id = packet.get("message_id")
-
-            save_path = decoder.handle_chunk(sender_peer_id, msg_id, chunk_index, total_chunks, chunk_data, media_type, filename)
-
-            if save_path:
-                with lock:
-                    console.print(f"[bold cyan][{sender}][/bold cyan] sent {media_type.lower()}: {filename}")
-                # Trigger rendering in a separate thread to not block on_message
-                def render():
-                    decoder.render_media(save_path, media_type)
-                threading.Thread(target=render, daemon=True).start()
-
-            # Check for missing chunks and request retransmit if needed
-            # For simplicity, we'll do this after every chunk for now if it's not complete
-            missing = decoder.chunk_manager.get_missing_chunks(sender_peer_id, msg_id)
-            if missing and chunk_index == total_chunks - 1: # Only if we got the last one but still missing some
-                 request = {
-                     "type": "RETRANSMIT_REQUEST",
-                     "sender": args.username,
-                     "sender_enc_public_key": keys.enc_public_b64,
-                     "sender_sign_public_key": keys.sign_public_b64,
-                     "message_id": msg_id,
-                     "missing_chunks": missing
-                 }
-                 # We need to resolve the sender's ip/port to send the request back
-                 # For now, let's assume we can find them in discovery
-                 matched = next((p for p in discovery.peers() if p.peer_id == sender_peer_id), None)
-                 if matched:
-                     transport.send_packet(matched.peer_id, matched.ip, matched.tcp_port, request)
-            return
-
-        if msg_type == "RETRANSMIT_REQUEST":
-            # Handle retransmit request (sender side)
-            # This would require keeping track of sent files/chunks
-            # For the first iteration, we might just log it
-            with lock:
-                console.print(f"[yellow]INFO[/yellow] Received retransmit request from {sender} for {packet.get('message_id')}")
-            return
-
-        with lock:
-            chat_peer = state["chat_peer"]
-            if chat_peer and sender_peer_id == chat_peer.peer_id:
-                console.print(
-                    f"[bold cyan][chat:{sender}][/bold cyan] [white]{plaintext}[/white]"
-                )
-            else:
-                console.print(f"[bold green]{sender}[/bold green] [white]{plaintext}[/white]")
-                if sender_peer_id:
-                    matched = next((p for p in discovery.peers() if p.peer_id == sender_peer_id), None)
-                    if matched is not None:
-                        if chat_peer is None:
-                            state["chat_peer"] = matched
-                            console.print(
-                                f"[cyan]INFO[/cyan] Auto-opened chat thread with {matched.username} "
-                                f"({matched.ip}:{matched.tcp_port}). Type reply directly or /exit."
-                            )
-                        elif chat_peer.peer_id != sender_peer_id:
-                            pending = state["pending_chats"]
-                            if sender_peer_id in pending:
-                                pending[sender_peer_id]["unread"] += 1
-                                pending[sender_peer_id]["peer"] = matched
-                                pending[sender_peer_id]["messages"].append(plaintext)
-                            else:
-                                pending[sender_peer_id] = {
-                                    "peer": matched,
-                                    "unread": 1,
-                                    "messages": [plaintext],
-                                }
-                            unread = pending[sender_peer_id]["unread"]
-                            console.print(
-                                f"[yellow]INFO[/yellow] New message from {matched.username} "
-                                f"({matched.ip}:{matched.tcp_port}) while active chat is "
-                                f"{chat_peer.username}. unread={unread}. Use '/chat switch' to switch."
-                            )
-
-    def resolve_target(peers: list, target_token: str):
-        # Explicit routing for duplicates: allow `username@port` or `ip:port`.
-        if "@" in target_token:
-            username, port_text = target_token.rsplit("@", 1)
-            if port_text.isdigit():
-                port = int(port_text)
-                return next(
-                    (p for p in peers if p.username == username and p.tcp_port == port),
-                    None,
+        complete_file = self.decoder.handle_chunk(
+            sender_peer_id, msg_id, chunk_index, total_chunks, chunk, media_type, filename
+        )
+        if complete_file:
+            with self.lock:
+                self.console.print(
+                    f"[cyan]INFO[/cyan] Received {media_type} '{filename}' from {sender}. Rendering..."
                 )
 
-        if ":" in target_token:
-            host, port_text = target_token.rsplit(":", 1)
-            if port_text.isdigit():
-                port = int(port_text)
-                return next((p for p in peers if p.ip == host and p.tcp_port == port), None)
+            def render() -> None:
+                with self.lock:
+                    self.decoder.render_media(complete_file, media_type)
 
-        matches = [p for p in peers if p.username == target_token]
-        if len(matches) == 1:
-            return matches[0]
-        return matches
+            threading.Thread(target=render, daemon=True).start()
 
-    def interactive_send_message() -> None:
-        peers = discovery.peers()
-        if not peers:
-            with lock:
-                console.print("[yellow]WARN[/yellow] No peers discovered. Try again in a moment.")
-            return
+        missing = self.decoder.chunk_manager.get_missing_chunks(sender_peer_id, msg_id)
+        if missing and chunk_index == total_chunks - 1:
+            request = {
+                "type": "RETRANSMIT_REQUEST",
+                "sender": self.username,
+                "sender_enc_public_key": self.keys.enc_public_b64,
+                "sender_sign_public_key": self.keys.sign_public_b64,
+                "message_id": msg_id,
+                "missing_chunks": missing,
+            }
+            matched = next((p for p in self.discovery.peers() if p.peer_id == sender_peer_id), None)
+            if matched:
+                self.transport.send_packet(matched.peer_id, matched.ip, matched.tcp_port, request)
 
-        with lock:
-            console.print("[cyan]Select recipient:[/cyan]")
-            for idx, peer in enumerate(peers, start=1):
-                console.print(f"  {idx}. {peer.username} ({peer.ip}:{peer.tcp_port})")
-
-        selection = input("peer number> ").strip()
-        if not selection.isdigit():
-            with lock:
-                console.print("[yellow]WARN[/yellow] Invalid selection.")
-            return
-
-        index = int(selection) - 1
-        if index < 0 or index >= len(peers):
-            with lock:
-                console.print("[yellow]WARN[/yellow] Selection out of range.")
-            return
-
-        text = input("message> ").strip()
-        if not text:
-            with lock:
-                console.print("[yellow]WARN[/yellow] Message is empty.")
-            return
-
-        target = peers[index]
-        send_encrypted_message(target, text)
-
-    def pick_peer_interactive():
-        peers = discovery.peers()
-        if not peers:
-            with lock:
-                console.print("[yellow]WARN[/yellow] No peers discovered. Try again in a moment.")
-            return None
-
-        with lock:
-            console.print("[cyan]Select recipient:[/cyan]")
-            for idx, peer in enumerate(peers, start=1):
-                console.print(f"  {idx}. {peer.username} ({peer.ip}:{peer.tcp_port})")
-
-        selection = input("peer number> ").strip()
-        if not selection.isdigit():
-            with lock:
-                console.print("[yellow]WARN[/yellow] Invalid selection.")
-            return None
-
-        index = int(selection) - 1
-        if index < 0 or index >= len(peers):
-            with lock:
-                console.print("[yellow]WARN[/yellow] Selection out of range.")
-            return None
-        return peers[index]
-
-    def send_media(target, filepath: str, media_type: str) -> bool:
-        import base64
-        import uuid
-        import tempfile
-
+    def send_media(self, target: Peer, filepath: str, media_type: str) -> bool:
         try:
             filename = os.path.basename(filepath)
-
-            # Optimize media
             with tempfile.NamedTemporaryFile(suffix=os.path.splitext(filename)[1], delete=False) as tmp:
-                optimized_path = encoder.optimize_image(filepath, tmp.name)
+                optimized_path = self.encoder.optimize_image(filepath, tmp.name)
 
-            chunks = decoder.chunk_manager.split_file(optimized_path)
+            chunks = self.decoder.chunk_manager.split_file(optimized_path)
             total_chunks = len(chunks)
             message_id = str(uuid.uuid4())
-
             recipient_public = parse_public_key_b64(target.enc_public_key_b64)
 
             success = True
             for i, chunk in enumerate(chunks):
                 chunk_b64 = base64.b64encode(chunk).decode("utf-8")
-                signature = sign_message(keys.sign_private, chunk_b64)
-                ciphertext = encrypt_message(keys.enc_private, recipient_public, chunk_b64)
+                signature = sign_message(self.keys.sign_private, chunk_b64)
+                ciphertext = encrypt_message(self.keys.enc_private, recipient_public, chunk_b64)
 
                 packet = {
                     "type": "FILE_CHUNK",
@@ -281,367 +236,343 @@ def main() -> None:
                     "message_id": message_id,
                     "chunk_index": i,
                     "total_chunks": total_chunks,
-                    "sender": args.username,
-                    "sender_enc_public_key": keys.enc_public_b64,
-                    "sender_sign_public_key": keys.sign_public_b64,
+                    "sender": self.username,
+                    "sender_enc_public_key": self.keys.enc_public_b64,
+                    "sender_sign_public_key": self.keys.sign_public_b64,
                     "ciphertext": ciphertext,
                     "signature": signature,
                 }
-
-                # Send chunk. Maybe don't wait for ACK for every single chunk to speed up?
-                # But requirement says "ACK tracking for chunks"
-                if not transport.send_packet(target.peer_id, target.ip, target.tcp_port, packet, wait_for_ack=True):
+                if not self.transport.send_packet(
+                    target.peer_id, target.ip, target.tcp_port, packet, wait_for_ack=True
+                ):
                     success = False
                     break
 
             if optimized_path != filepath:
-                try: os.unlink(optimized_path)
-                except: pass
+                try:
+                    os.unlink(optimized_path)
+                except OSError:
+                    pass
 
-            with lock:
+            with self.lock:
                 if success:
-                    console.print(f"[cyan]INFO[/cyan] {media_type} '{filename}' sent successfully to {target.username}")
+                    self.console.print(f"[cyan]INFO[/cyan] {media_type} '{filename}' sent successfully to {target.username}")
                 else:
-                    console.print(f"[yellow]WARN[/yellow] Failed to send {media_type} to {target.username}")
+                    self.console.print(f"[yellow]WARN[/yellow] Failed to send {media_type} to {target.username}")
             return success
 
         except Exception as e:
-            with lock:
-                console.print(f"[red]Error sending media: {e}[/red]")
+            with self.lock:
+                self.console.print(f"[red]Error sending media: {e}[/red]")
             return False
 
-    def send_encrypted_message(target, text: str) -> bool:
+    def send_encrypted_message(self, target: Peer, text: str) -> bool:
         try:
             recipient_public = parse_public_key_b64(target.enc_public_key_b64)
-            signature = sign_message(keys.sign_private, text)
-            ciphertext = encrypt_message(keys.enc_private, recipient_public, text)
-            packet = {
-                "type": "MESSAGE",
-                "sender": args.username,
-                "sender_enc_public_key": keys.enc_public_b64,
-                "sender_sign_public_key": keys.sign_public_b64,
-                "ciphertext": ciphertext,
-                "signature": signature,
-            }
-            success = transport.send_packet(
+            signature = sign_message(self.keys.sign_private, text)
+            ciphertext = encrypt_message(self.keys.enc_private, recipient_public, text)
+
+            packet = MessagePacket(
+                sender=self.username,
+                sender_peer_id=self.peer_id,
+                sender_enc_public_key=self.keys.enc_public_b64,
+                sender_sign_public_key=self.keys.sign_public_b64,
+                ciphertext=ciphertext,
+                signature=signature,
+                message_id=secrets.token_hex(16),
+            )
+            success = self.transport.send_packet(
                 target.peer_id,
                 target.ip,
                 target.tcp_port,
-                packet,
+                packet.to_dict(),
                 wait_for_ack=True,
             )
-            with lock:
+            with self.lock:
                 if success:
-                    console.print(
+                    self.console.print(
                         f"[cyan]INFO[/cyan] Encrypted message sent and ACKed by {target.username} ({target.ip}:{target.tcp_port})"
                     )
                 else:
-                    console.print(
+                    self.console.print(
                         f"[yellow]WARN[/yellow] Message sent to {target.username} but no ACK received."
                     )
             return success
         except OSError as exc:
-            with lock:
-                console.print(f"[yellow]WARN[/yellow] Send failed: {exc}")
+            with self.lock:
+                self.console.print(f"[yellow]WARN[/yellow] Send failed: {exc}")
             return False
 
-    def start_chat_thread(target) -> None:
-        pending_entry = state["pending_chats"].pop(target.peer_id, None)
-        state["chat_peer"] = target
-        with lock:
-            console.print(
+    def pick_peer_interactive(self) -> Optional[Peer]:
+        peers = self.discovery.peers()
+        if not peers:
+            with self.lock:
+                self.console.print("[yellow]WARN[/yellow] No peers discovered. Try again in a moment.")
+            return None
+
+        with self.lock:
+            self.console.print("[cyan]Select recipient:[/cyan]")
+            for idx, peer in enumerate(peers, start=1):
+                trust_indicator = "" if peer.is_trusted else " [red](UNTRUSTED)[/red]"
+                self.console.print(f"  {idx}. {peer.username} ({peer.ip}:{peer.tcp_port}){trust_indicator}")
+
+        selection = input("peer number> ").strip()
+        if not selection.isdigit():
+            with self.lock:
+                self.console.print("[yellow]WARN[/yellow] Invalid selection.")
+            return None
+
+        index = int(selection) - 1
+        if index < 0 or index >= len(peers):
+            with self.lock:
+                self.console.print("[yellow]WARN[/yellow] Selection out of range.")
+            return None
+        return peers[index]
+
+    def start_chat_thread(self, target: Peer) -> None:
+        pending_entry = self.session.set_active_peer(target)
+        with self.lock:
+            self.console.print(
                 f"[bold cyan]Chat thread opened with {target.username} ({target.ip}:{target.tcp_port}). "
                 "Type messages directly. Use /exit to close thread.[/bold cyan]"
             )
             if pending_entry and pending_entry.get("messages"):
-                console.print("[cyan]Unread messages:[/cyan]")
+                self.console.print("[cyan]Unread messages:[/cyan]")
                 for msg in pending_entry["messages"]:
-                    console.print(
-                        f"[bold cyan][chat:{target.username}][/bold cyan] [white]{msg}[/white]"
-                    )
+                    self.console.print(f"[bold cyan][chat:{target.username}][/bold cyan] [white]{msg}[/white]")
 
-    def show_pending_chats() -> None:
-        pending = state["pending_chats"]
-        if not pending:
-            with lock:
-                console.print("[cyan]INFO[/cyan] No pending chats.")
-            return
-        with lock:
-            console.print("[cyan]Pending chats:[/cyan]")
-            for idx, item in enumerate(pending.values(), start=1):
-                peer = item["peer"]
-                unread = item["unread"]
-                console.print(
-                    f"  {idx}. {peer.username} ({peer.ip}:{peer.tcp_port}) unread={unread}"
-                )
-
-    def switch_chat_thread(target_token: str | None = None) -> None:
-        pending = state["pending_chats"]
-        if not pending:
-            with lock:
-                console.print("[cyan]INFO[/cyan] No pending chats to switch.")
+    def handle_chat_switch(self, target_token: Optional[str] = None) -> None:
+        pending_items = self.session.get_pending_chats()
+        if not pending_items:
+            with self.lock:
+                self.console.print("[cyan]INFO[/cyan] No pending chats to switch.")
             return
 
         if target_token is None:
-            with lock:
-                console.print("[cyan]Select pending chat to switch:[/cyan]")
-                items = list(pending.values())
-                for idx, item in enumerate(items, start=1):
+            with self.lock:
+                self.console.print("[cyan]Select pending chat to switch:[/cyan]")
+                for idx, item in enumerate(pending_items, start=1):
                     peer = item["peer"]
-                    console.print(
-                        f"  {idx}. {peer.username} ({peer.ip}:{peer.tcp_port}) unread={item['unread']}"
-                    )
+                    self.console.print(f"  {idx}. {peer.username} ({peer.ip}:{peer.tcp_port}) unread={item['unread']}")
             selection = input("switch number> ").strip()
             if not selection.isdigit():
-                with lock:
-                    console.print("[yellow]WARN[/yellow] Invalid selection.")
+                with self.lock:
+                    self.console.print("[yellow]WARN[/yellow] Invalid selection.")
                 return
             index = int(selection) - 1
-            if index < 0 or index >= len(items):
-                with lock:
-                    console.print("[yellow]WARN[/yellow] Selection out of range.")
+            if index < 0 or index >= len(pending_items):
+                with self.lock:
+                    self.console.print("[yellow]WARN[/yellow] Selection out of range.")
                 return
-            start_chat_thread(items[index]["peer"])
+            self.start_chat_thread(pending_items[index]["peer"])
             return
 
-        peers = [item["peer"] for item in pending.values()]
-        resolved = resolve_target(peers, target_token)
+        peers = [item["peer"] for item in pending_items]
+        resolved = SessionManager.resolve_target(peers, target_token)
         if resolved is None:
-            with lock:
-                console.print(
-                    f"[yellow]WARN[/yellow] Pending chat target '{target_token}' not found."
-                )
+            with self.lock:
+                self.console.print(f"[yellow]WARN[/yellow] Pending chat target '{target_token}' not found.")
             return
         if isinstance(resolved, list):
             options = ", ".join(f"{p.username}@{p.tcp_port} ({p.ip}:{p.tcp_port})" for p in resolved)
-            with lock:
-                console.print(
-                    f"[yellow]WARN[/yellow] Multiple pending peers for '{target_token}': {options}. "
-                    "Use '/chat switch' interactive picker."
-                )
+            with self.lock:
+                self.console.print(f"[yellow]WARN[/yellow] Multiple pending peers for '{target_token}': {options}.")
             return
-        start_chat_thread(resolved)
+        self.start_chat_thread(resolved)
 
-    discovery = DiscoveryService(
-        peer_id=peer_id,
-        username=args.username,
-        tcp_port=args.port,
-        enc_public_key_b64=keys.enc_public_b64,
-        sign_public_key_b64=keys.sign_public_b64,
-    )
-    transport = TransportService(local_peer_id=peer_id, listen_port=args.port, on_message=on_message)
+    def run(self) -> None:
+        if not self.verify_port_available():
+            return
 
-    discovery.start()
-    transport.start()
+        self.discovery.start()
+        self.transport.start()
 
-    try:
-        with lock:
-            console.print("[cyan]INFO[/cyan] GhostChat started")
-            console.print(f"[cyan]INFO[/cyan] peer_id={peer_id}")
-            console.print("[cyan]INFO[/cyan] Encryption and signatures enabled")
-            render_dashboard()
+        try:
+            with self.lock:
+                self.console.print("[cyan]INFO[/cyan] GhostChat started (v0.2.0 Hardened)")
+                self.console.print(f"[cyan]INFO[/cyan] peer_id={self.peer_id}")
+                self.console.print(f"[cyan]INFO[/cyan] fingerprint={self.keys.fingerprint}")
+                self.console.print("[cyan]INFO[/cyan] Signed discovery, length-prefixed framing & TOFU active")
+                self.console.print(self.ui.dashboard(self.discovery.peers()))
 
-        while True:
-            line = input("> ").strip()
-            if not line:
-                continue
-
-            if line == "/peers":
-                peers = discovery.peers()
-                with lock:
-                    console.print(f"[cyan]INFO[/cyan] {len(peers)} peer(s) discovered")
-                    console.print(ui.peers_panel(peers))
-                    duplicate_usernames = {
-                        p.username for p in peers if sum(1 for q in peers if q.username == p.username) > 1
-                    }
-                    if duplicate_usernames:
-                        console.print(
-                            "[yellow]WARN[/yellow] Duplicate usernames detected. "
-                            "Use '/msg <username>@<port> <text>' to target a specific peer."
-                        )
-                continue
-
-            if line == "/help":
-                with lock:
-                    console.print("[cyan]INFO[/cyan] /peers: show discovered peers")
-                    console.print("[cyan]INFO[/cyan] /msg <username> <text>: send encrypted message")
-                    console.print("[cyan]INFO[/cyan] /msg: interactive recipient picker")
-                    console.print("[cyan]INFO[/cyan] /sendimg <target> <path>: send image")
-                    console.print("[cyan]INFO[/cyan] /sendgif <target> <path>: send gif")
-                    console.print("[cyan]INFO[/cyan] /chat or /chat-thread: open interactive chat thread")
-                    console.print("[cyan]INFO[/cyan] /chat <target>: open thread to username / username@port / ip:port")
-                    console.print("[cyan]INFO[/cyan] /chat switch [target]: switch to pending chat")
-                    console.print("[cyan]INFO[/cyan] /chat pending: list pending chats")
-                    console.print("[cyan]INFO[/cyan] /exit: close current chat thread")
-                    console.print("[cyan]INFO[/cyan] /quit: exit")
-                continue
-
-            if line == "/msg":
-                interactive_send_message()
-                continue
-
-            if line.startswith("/sendimg ") or line.startswith("/sendgif "):
-                parts = line.split(" ", 2)
-                if len(parts) < 3:
-                    cmd = parts[0]
-                    with lock:
-                        console.print(f"[yellow]WARN[/yellow] Usage: {cmd} <target> <path>")
+            while True:
+                line = input("> ").strip()
+                if not line:
                     continue
 
-                cmd, target_token, filepath = parts[0], parts[1], parts[2]
-                media_type = "IMAGE" if cmd == "/sendimg" else "GIF"
-
-                peers = discovery.peers()
-                resolved = resolve_target(peers, target_token)
-                if resolved is None:
-                    with lock:
-                        console.print(f"[yellow]WARN[/yellow] Peer '{target_token}' not found.")
-                    continue
-                if isinstance(resolved, list):
-                    with lock:
-                        console.print(f"[yellow]WARN[/yellow] Multiple peers found for '{target_token}'. Use more specific target.")
+                if line == "/peers":
+                    peers = self.discovery.peers()
+                    with self.lock:
+                        self.console.print(f"[cyan]INFO[/cyan] {len(peers)} peer(s) discovered")
+                        self.console.print(self.ui.peers_panel(peers))
                     continue
 
-                if not os.path.exists(filepath):
-                    with lock:
-                        console.print(f"[yellow]WARN[/yellow] File not found: {filepath}")
+                if line == "/help":
+                    with self.lock:
+                        self.console.print("[cyan]INFO[/cyan] /peers: show discovered peers")
+                        self.console.print("[cyan]INFO[/cyan] /msg <username> <text>: send encrypted message")
+                        self.console.print("[cyan]INFO[/cyan] /msg: interactive recipient picker")
+                        self.console.print("[cyan]INFO[/cyan] /sendimg <target> <path>: send encrypted image")
+                        self.console.print("[cyan]INFO[/cyan] /sendgif <target> <path>: send encrypted gif")
+                        self.console.print("[cyan]INFO[/cyan] /chat or /chat-thread: open interactive chat thread")
+                        self.console.print("[cyan]INFO[/cyan] /chat <target>: open thread directly")
+                        self.console.print("[cyan]INFO[/cyan] /chat switch [target]: switch to pending chat")
+                        self.console.print("[cyan]INFO[/cyan] /chat pending: list pending chats")
+                        self.console.print("[cyan]INFO[/cyan] /exit: close current chat thread")
+                        self.console.print("[cyan]INFO[/cyan] /quit: exit GhostChat")
                     continue
 
-                send_media(resolved, filepath, media_type)
-                continue
-
-            if line.startswith("/msg "):
-                parts = line.split(" ", 2)
-                if len(parts) < 3:
-                    with lock:
-                        console.print("[yellow]WARN[/yellow] Usage: /msg <username> <text>")
+                if line == "/msg":
+                    target = self.pick_peer_interactive()
+                    if target:
+                        text = input("message> ").strip()
+                        if text:
+                            self.send_encrypted_message(target, text)
                     continue
-                target_username, text = parts[1], parts[2]
-                peers = discovery.peers()
-                resolved = resolve_target(peers, target_username)
-                if resolved is None:
-                    with lock:
-                        console.print(
-                            f"[yellow]WARN[/yellow] Peer '{target_username}' not found. Try /peers"
-                        )
-                    continue
-                if isinstance(resolved, list):
-                    options = ", ".join(
-                        f"{p.username}@{p.tcp_port} ({p.ip}:{p.tcp_port})" for p in resolved
-                    )
-                    with lock:
-                        console.print(
-                            f"[yellow]WARN[/yellow] Multiple peers named '{target_username}': {options}. "
-                            "Use '/msg <username>@<port> <text>' or use the interactive picker by typing '/msg'."
-                        )
-                    continue
-                target = resolved
-                send_encrypted_message(target, text)
-                continue
 
-            if line == "/chat" or line == "/chat-thread":
-                target = pick_peer_interactive()
-                if target:
-                    start_chat_thread(target)
-                continue
-
-            if line == "/chat pending":
-                show_pending_chats()
-                continue
-
-            if line == "/chat switch":
-                switch_chat_thread()
-                continue
-
-            if line.startswith("/chat switch "):
-                target_token = line.split(" ", 2)[2].strip()
-                if not target_token:
-                    with lock:
-                        console.print("[yellow]WARN[/yellow] Usage: /chat switch [target]")
-                    continue
-                switch_chat_thread(target_token)
-                continue
-
-            if line.startswith("/chat ") or line.startswith("/chat-thread "):
-                parts = line.split(" ", 1)
-                if len(parts) < 2:
-                    with lock:
-                        console.print("[yellow]WARN[/yellow] Usage: /chat <target>")
-                    continue
-                target_token = parts[1].strip()
-                peers = discovery.peers()
-                resolved = resolve_target(peers, target_token)
-                if resolved is None:
-                    with lock:
-                        console.print(
-                            f"[yellow]WARN[/yellow] Peer '{target_token}' not found. Try /peers"
-                        )
-                    continue
-                if isinstance(resolved, list):
-                    options = ", ".join(
-                        f"{p.username}@{p.tcp_port} ({p.ip}:{p.tcp_port})" for p in resolved
-                    )
-                    with lock:
-                        console.print(
-                            f"[yellow]WARN[/yellow] Multiple peers named '{target_token}': {options}. "
-                            "Use '/chat <username>@<port>' or '/chat' picker."
-                        )
-                    continue
-                start_chat_thread(resolved)
-                continue
-
-            if state["chat_peer"] is not None:
-                if line == "/exit":
-                    with lock:
-                        console.print("[cyan]INFO[/cyan] Chat thread closed.")
-                    state["chat_peer"] = None
+                if line.startswith("/msg "):
+                    parts = line.split(" ", 2)
+                    if len(parts) < 3:
+                        with self.lock:
+                            self.console.print("[yellow]WARN[/yellow] Usage: /msg <username> <text>")
+                        continue
+                    target_token, text = parts[1], parts[2]
+                    resolved = SessionManager.resolve_target(self.discovery.peers(), target_token)
+                    if resolved is None:
+                        with self.lock:
+                            self.console.print(f"[yellow]WARN[/yellow] Peer '{target_token}' not found. Try /peers")
+                        continue
+                    if isinstance(resolved, list):
+                        options = ", ".join(f"{p.username}@{p.tcp_port} ({p.ip}:{p.tcp_port})" for p in resolved)
+                        with self.lock:
+                            self.console.print(f"[yellow]WARN[/yellow] Multiple peers named '{target_token}': {options}")
+                        continue
+                    self.send_encrypted_message(resolved, text)
                     continue
 
                 if line.startswith("/sendimg ") or line.startswith("/sendgif "):
-                    parts = line.split(" ", 1)
-                    if len(parts) < 2:
+                    parts = line.split(" ", 2)
+                    if len(parts) < 3:
                         cmd = parts[0]
-                        with lock:
-                            console.print(f"[yellow]WARN[/yellow] Usage: {cmd} <path>")
+                        with self.lock:
+                            self.console.print(f"[yellow]WARN[/yellow] Usage: {cmd} <target> <path>")
                         continue
-
-                    cmd, filepath = parts[0], parts[1].strip()
+                    cmd, target_token, filepath = parts[0], parts[1], parts[2]
                     media_type = "IMAGE" if cmd == "/sendimg" else "GIF"
-
+                    resolved = SessionManager.resolve_target(self.discovery.peers(), target_token)
+                    if resolved is None:
+                        with self.lock:
+                            self.console.print(f"[yellow]WARN[/yellow] Peer '{target_token}' not found.")
+                        continue
+                    if isinstance(resolved, list):
+                        with self.lock:
+                            self.console.print(f"[yellow]WARN[/yellow] Multiple peers found for '{target_token}'.")
+                        continue
                     if not os.path.exists(filepath):
-                        with lock:
-                            console.print(f"[yellow]WARN[/yellow] File not found: {filepath}")
+                        with self.lock:
+                            self.console.print(f"[yellow]WARN[/yellow] File not found: {filepath}")
+                        continue
+                    self.send_media(resolved, filepath, media_type)
+                    continue
+
+                if line in ("/chat", "/chat-thread"):
+                    target = self.pick_peer_interactive()
+                    if target:
+                        self.start_chat_thread(target)
+                    continue
+
+                if line == "/chat pending":
+                    pending = self.session.get_pending_chats()
+                    with self.lock:
+                        if not pending:
+                            self.console.print("[cyan]INFO[/cyan] No pending chats.")
+                        else:
+                            self.console.print("[cyan]Pending chats:[/cyan]")
+                            for idx, item in enumerate(pending, start=1):
+                                p = item["peer"]
+                                self.console.print(f"  {idx}. {p.username} ({p.ip}:{p.tcp_port}) unread={item['unread']}")
+                    continue
+
+                if line == "/chat switch":
+                    self.handle_chat_switch()
+                    continue
+
+                if line.startswith("/chat switch "):
+                    target_token = line.split(" ", 2)[2].strip()
+                    self.handle_chat_switch(target_token)
+                    continue
+
+                if line.startswith("/chat ") or line.startswith("/chat-thread "):
+                    target_token = line.split(" ", 1)[1].strip()
+                    resolved = SessionManager.resolve_target(self.discovery.peers(), target_token)
+                    if resolved is None:
+                        with self.lock:
+                            self.console.print(f"[yellow]WARN[/yellow] Peer '{target_token}' not found.")
+                        continue
+                    if isinstance(resolved, list):
+                        options = ", ".join(f"{p.username}@{p.tcp_port} ({p.ip}:{p.tcp_port})" for p in resolved)
+                        with self.lock:
+                            self.console.print(f"[yellow]WARN[/yellow] Multiple peers named '{target_token}': {options}")
+                        continue
+                    self.start_chat_thread(resolved)
+                    continue
+
+                # Thread active mode handling
+                if self.session.chat_peer is not None:
+                    if line == "/exit":
+                        with self.lock:
+                            self.console.print("[cyan]INFO[/cyan] Chat thread closed.")
+                        self.session.close_active_thread()
                         continue
 
-                    send_media(state["chat_peer"], filepath, media_type)
+                    if line.startswith("/sendimg ") or line.startswith("/sendgif "):
+                        parts = line.split(" ", 1)
+                        if len(parts) < 2:
+                            cmd = parts[0]
+                            with self.lock:
+                                self.console.print(f"[yellow]WARN[/yellow] Usage: {cmd} <path>")
+                            continue
+                        cmd, filepath = parts[0], parts[1].strip()
+                        media_type = "IMAGE" if cmd == "/sendimg" else "GIF"
+                        if not os.path.exists(filepath):
+                            with self.lock:
+                                self.console.print(f"[yellow]WARN[/yellow] File not found: {filepath}")
+                            continue
+                        self.send_media(self.session.chat_peer, filepath, media_type)
+                        continue
+
+                    if line.startswith("/"):
+                        with self.lock:
+                            self.console.print("[yellow]WARN[/yellow] Unknown chat command. Use /exit to close thread.")
+                        continue
+
+                    target = self.session.chat_peer
+                    success = self.send_encrypted_message(target, line)
+                    if not success:
+                        with self.lock:
+                            self.console.print(
+                                "[yellow]WARN[/yellow] Message delivery failed (peer offline or ACK timeout)."
+                            )
                     continue
 
-                if line.startswith("/"):
-                    with lock:
-                        console.print("[yellow]WARN[/yellow] Unknown chat command. Use /exit to close chat.")
-                    continue
-                target = state["chat_peer"]
-                success = send_encrypted_message(target, line)
-                if not success:
-                    with lock:
-                        console.print(
-                            "[yellow]WARN[/yellow] Chat thread closed because peer is offline or ACK failed."
-                        )
-                    state["chat_peer"] = None
-                continue
+                if line == "/quit":
+                    break
 
-            if line == "/quit":
-                break
+                with self.lock:
+                    self.console.print("[yellow]WARN[/yellow] Unknown command. Try /help")
 
-            with lock:
-                console.print("[yellow]WARN[/yellow] Unknown command. Try /help")
+        except (KeyboardInterrupt, EOFError):
+            pass
+        finally:
+            self.discovery.stop()
+            self.transport.stop()
+            self.console.print("Goodbye.")
 
-    except (KeyboardInterrupt, EOFError):
-        pass
-    finally:
-        discovery.stop()
-        transport.stop()
-        console.print("Goodbye.")
+
+def main() -> None:
+    args = parse_args()
+    app = GhostChatApp(username=args.username, port=args.port)
+    app.run()
 
 
 if __name__ == "__main__":

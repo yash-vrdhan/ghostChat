@@ -3,7 +3,14 @@ import socket
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional
+
+from nacl.signing import SigningKey
+
+from ghostchat.crypto.keys import parse_verify_key_b64
+from ghostchat.crypto.known_hosts import KnownHostsManager
+from ghostchat.crypto.signing import sign_message, verify_signature
+from ghostchat.protocol.packets import DiscoverPacket
 
 
 DISCOVERY_PORT = 54545
@@ -20,6 +27,8 @@ class Peer:
     enc_public_key_b64: str
     sign_public_key_b64: str
     last_seen: float
+    is_trusted: bool = True
+    trust_warning: Optional[str] = None
 
 
 class DiscoveryService:
@@ -30,12 +39,17 @@ class DiscoveryService:
         tcp_port: int,
         enc_public_key_b64: str,
         sign_public_key_b64: str,
+        sign_private: Optional[SigningKey] = None,
+        known_hosts: Optional[KnownHostsManager] = None,
     ) -> None:
         self.peer_id = peer_id
         self.username = username
         self.tcp_port = tcp_port
         self.enc_public_key_b64 = enc_public_key_b64
         self.sign_public_key_b64 = sign_public_key_b64
+        self.sign_private = sign_private
+        self.known_hosts = known_hosts
+
         self._stop_event = threading.Event()
         self._peers: Dict[str, Peer] = {}
         self._lock = threading.Lock()
@@ -58,20 +72,24 @@ class DiscoveryService:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
         while not self._stop_event.is_set():
-            packet = {
-                "type": "DISCOVER",
-                "peer_id": self.peer_id,
-                "username": self.username,
-                "port": self.tcp_port,
-                "enc_public_key": self.enc_public_key_b64,
-                "sign_public_key": self.sign_public_key_b64,
-            }
-            data = json.dumps(packet).encode("utf-8")
+            packet = DiscoverPacket(
+                peer_id=self.peer_id,
+                username=self.username,
+                port=self.tcp_port,
+                enc_public_key=self.enc_public_key_b64,
+                sign_public_key=self.sign_public_key_b64,
+            )
+            if self.sign_private:
+                packet.signature = sign_message(self.sign_private, packet.canonical_data())
+
+            data = json.dumps(packet.to_dict()).encode("utf-8")
             try:
                 sock.sendto(data, ("255.255.255.255", DISCOVERY_PORT))
             except OSError:
                 pass
             time.sleep(DISCOVERY_INTERVAL_SECONDS)
+
+        sock.close()
 
     def _listen_loop(self) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -80,11 +98,12 @@ class DiscoveryService:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         except (AttributeError, OSError):
             pass
+
         try:
             sock.bind(("", DISCOVERY_PORT))
         except OSError as exc:
             print(f"[discovery] listener disabled: cannot bind UDP port {DISCOVERY_PORT} ({exc})")
-            print("[discovery] another process may own that port without reuse enabled; restart all GhostChat nodes after updating.")
+            print("[discovery] another process may own that port without reuse enabled.")
             sock.close()
             return
 
@@ -95,34 +114,57 @@ class DiscoveryService:
                 continue
 
             try:
-                packet = json.loads(data.decode("utf-8"))
+                payload = json.loads(data.decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 continue
 
-            if packet.get("type") != "DISCOVER":
+            if payload.get("type") != "DISCOVER":
                 continue
 
-            peer_id = packet.get("peer_id")
-            if not peer_id or peer_id == self.peer_id:
+            packet = DiscoverPacket.from_dict(payload)
+            if not packet.peer_id or packet.peer_id == self.peer_id:
                 continue
 
-            enc_public_key_b64 = packet.get("enc_public_key")
-            sign_public_key_b64 = packet.get("sign_public_key")
-            if not enc_public_key_b64 or not sign_public_key_b64:
+            if not packet.enc_public_key or not packet.sign_public_key:
                 continue
+
+            # Verify signature if present
+            if packet.signature:
+                try:
+                    verify_key = parse_verify_key_b64(packet.sign_public_key)
+                    if not verify_signature(verify_key, packet.canonical_data(), packet.signature):
+                        # Signature verification failed: spoofed / tampered packet
+                        continue
+                except Exception:
+                    continue
+
+            # TOFU check against known hosts
+            is_trusted = True
+            trust_warning = None
+            if self.known_hosts:
+                is_trusted, trust_warning = self.known_hosts.check_or_pin(
+                    peer_id=packet.peer_id,
+                    username=packet.username,
+                    enc_public_key=packet.enc_public_key,
+                    sign_public_key=packet.sign_public_key,
+                )
 
             peer = Peer(
-                peer_id=peer_id,
-                username=packet.get("username", "unknown"),
+                peer_id=packet.peer_id,
+                username=packet.username or "unknown",
                 ip=addr[0],
-                tcp_port=int(packet.get("port", 0)),
-                enc_public_key_b64=enc_public_key_b64,
-                sign_public_key_b64=sign_public_key_b64,
+                tcp_port=packet.port,
+                enc_public_key_b64=packet.enc_public_key,
+                sign_public_key_b64=packet.sign_public_key,
                 last_seen=time.time(),
+                is_trusted=is_trusted,
+                trust_warning=trust_warning,
             )
 
             with self._lock:
-                self._peers[peer_id] = peer
+                self._peers[packet.peer_id] = peer
+
+        sock.close()
 
     def _cleanup_loop(self) -> None:
         while not self._stop_event.is_set():

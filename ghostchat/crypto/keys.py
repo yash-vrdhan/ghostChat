@@ -1,4 +1,5 @@
 import base64
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -33,8 +34,31 @@ class NodeKeys:
         return base64.b16encode(raw[:8]).decode("ascii").lower()
 
 
+def get_key_dir(profile: str = "default") -> Path:
+    safe_profile = "".join(c for c in profile if c.isalnum() or c in ("-", "_")).strip("_-")
+    if not safe_profile:
+        safe_profile = "default"
+    key_dir = KEY_ROOT_DIR / safe_profile
+    key_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(key_dir, 0o700)
+    except OSError:
+        pass
+    return key_dir
+
+
 def _write_private_key(path: Path, raw: bytes) -> None:
-    path.write_text(base64.b64encode(raw).decode("ascii"), encoding="utf-8")
+    """Safely write private key with POSIX 0600 permissions."""
+    content = base64.b64encode(raw).decode("ascii").encode("utf-8")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(path, flags, 0o600)
+    try:
+        with open(fd, "wb", closefd=True) as f:
+            f.write(content)
+        os.chmod(path, 0o600)
+    except Exception:
+        os.close(fd)
+        raise
 
 
 def _read_private_key(path: Path) -> bytes:
@@ -42,12 +66,7 @@ def _read_private_key(path: Path) -> bytes:
 
 
 def load_or_create_keys(profile: str = "default") -> NodeKeys:
-    safe_profile = "".join(c for c in profile if c.isalnum() or c in ("-", "_")).strip("_-")
-    if not safe_profile:
-        safe_profile = "default"
-    key_dir = KEY_ROOT_DIR / safe_profile
-    key_dir.mkdir(parents=True, exist_ok=True)
-
+    key_dir = get_key_dir(profile)
     enc_path = key_dir / ENC_PRIVATE_FILE
     sign_path = key_dir / SIGN_PRIVATE_FILE
 

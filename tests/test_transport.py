@@ -126,3 +126,22 @@ def test_send_packet_returns_false_for_unreachable_peer() -> None:
         assert ok is False
     finally:
         node_a.stop()
+
+
+def test_transport_rejects_frame_exceeding_max_packet_size() -> None:
+    recv_packets: list[dict] = []
+    port = _free_port()
+    node = TransportService(local_peer_id="node", listen_port=port, on_message=recv_packets.append)
+    node.start()
+    try:
+        import struct
+        s = socket.create_connection(("127.0.0.1", port), timeout=2)
+        s.sendall(struct.pack("!I", 70000))
+        s.settimeout(1.0)
+        chunk = s.recv(1024)
+        assert chunk == b""  # Connection closed by node upon reading oversized header
+        assert len(recv_packets) == 0
+        s.close()
+    finally:
+        node.stop()
+

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ghostchat"
-version = "0.1.0"
+version = "0.2.0"
 description = "Distributed end-to-end encrypted terminal messaging (learning project)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -25,7 +25,15 @@ dev = [
 ghostchat = "ghostchat.main:main"
 
 [tool.setuptools]
-packages = ["ghostchat", "ghostchat.network", "ghostchat.crypto", "ghostchat.ui"]
+packages = [
+  "ghostchat",
+  "ghostchat.network",
+  "ghostchat.crypto",
+  "ghostchat.ui",
+  "ghostchat.protocol",
+  "ghostchat.session",
+  "ghostchat.media",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
