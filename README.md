@@ -1,11 +1,46 @@
 
+```text
+    .-.     ____ _               _    ____ _           _   
+  .'   `.  / ___| |__   ___  ___| |_ / ___| |__   __ _| |_ 
+ :       :| |  _| '_ \ / _ \/ __| __| |   | '_ \ / _` | __|
+ : O   O :| |_| | | | | (_) \__ \ |_| |___| | | | (_| | |_ 
+ :  (_)  : \____|_| |_|\___/|___/\__|\____|_| |_|\__,_|\__|
+  `~"~"~`  LAN-first End-to-End Encrypted P2P Terminal Messenger
+```
+
 # GhostChat
 
-GhostChat is a LAN-first terminal chat application for learning distributed systems and applied cryptography.
+**GhostChat** is a LAN-first, end-to-end encrypted peer-to-peer terminal chat application built for distributed systems and applied cryptography.
 
-It uses peer discovery, persistent peer-to-peer TCP sessions, length-prefixed protocol framing, end-to-end encryption, digital signatures, delivery ACKs, and Trust-On-First-Use (TOFU) key pinning.
+[![Python](https://img.shields.io/badge/Python-3.9+-3776AB?style=flat&logo=python&logoColor=white)](https://python.org)
+[![Security](https://img.shields.io/badge/Cryptography-PyNaCl%20%28Ed25519%20%2B%20Curve25519%29-blueviolet)](https://pynacl.readthedocs.io/)
+[![TUI](https://img.shields.io/badge/UI-Textual%20TUI-00f0ff)](https://textual.textualize.io/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-> 📘 **Deep Dive & Architecture Guide**: Check out [LEARNING_AND_IMPLEMENTATION.md](LEARNING_AND_IMPLEMENTATION.md) for detailed explanations of the systems foundations, vulnerabilities discovered, before/after code comparisons, and future roadmap.
+[**🚀 Quickstart Guide (Step-by-Step with Screenshots)**](QUICKSTART.md) • [**📘 Deep Dive & Architecture Guide**](LEARNING_AND_IMPLEMENTATION.md)
+
+<p align="center">
+  <img src="docs/assets/01_welcome_dashboard.png" alt="GhostChat Welcome Dashboard" width="850">
+</p>
+
+---
+
+## 🚀 2-Minute Quickstart
+
+Want to see GhostChat in action immediately? Follow the steps below or check out the full [**Quickstart Guide**](QUICKSTART.md).
+
+```bash
+# 1. Install dependencies
+poetry install
+
+# 2. Terminal 1: Launch Alice's node
+poetry run ghostchat --username alice --port 5001
+
+# 3. Terminal 2: Launch Bob's node
+poetry run ghostchat --username bob --port 5002
+```
+
+Both nodes will automatically discover each other via LAN UDP broadcast (`:54545`), exchange and verify Ed25519 signatures, and pin keys (TOFU). Select a peer from the sidebar to open an encrypted chat thread!
 
 ---
 
