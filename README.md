@@ -51,16 +51,19 @@ Both nodes will automatically discover each other via LAN UDP broadcast (`:54545
   - Signed messages and discovery beacons (Ed25519)
   - Strict POSIX file permissions (`0600` for secret keys, `0700` for profile directories)
   - Trust-On-First-Use (TOFU) host key pinning in `~/.ghostchat/<username>/known_hosts.json`
-- **Network & Protocol**:
+- **Network, Mesh & Gossip Protocol**:
   - UDP LAN peer discovery with signed broadcast beacons (`:54545`)
   - Persistent TCP sessions per peer (`peer_id -> socket` reuse with write locks)
   - Length-prefixed binary framing (`[4-byte uint32 length][payload]`) with a 64 KB DoS guard
-  - Delivery ACK feedback with timeout handling
+  - Epidemic Gossip Protocol for decentralized group channels (`#general`, `#dev-mesh`) with bounded TTL hop limits
+  - LRU Seen Cache (`message_id` deduplication) for broadcast storm suppression
+  - Authenticated `SecretBox` (XSalsa20-Poly1305) channel encryption derived via PBKDF2-HMAC-SHA256 for private keyed channels
+  - Delivery ACK feedback with timeout handling for direct messages
   - Duplicate message suppression by `message_id`
 - **Modern Graphical TUI (Claude Code / Gemini CLI Aesthetic)**:
   - Built with [Textual](https://textual.textualize.io/) featuring custom developer dark styling, neon cyan highlights, and violet accents
   - Custom ASCII Ghost logo and cryptographic identity dashboard
-  - Dedicated left sidebar for discovered peers with real-time online indicators and unread badges
+  - Dedicated left sidebar for group channels and active peers with real-time online indicators and unread badges
   - Isolated bottom input dock that completely eliminates prompt clobbering from background network events
   - Seamless view transition between Welcome Dashboard and Active Conversation feeds
   - Dual launch mode: opens full graphical TUI by default; `--cli` flag available for classic line mode

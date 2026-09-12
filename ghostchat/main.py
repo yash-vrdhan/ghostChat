@@ -6,7 +6,7 @@ import socket
 import tempfile
 import threading
 import uuid
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from rich.console import Console
 
@@ -22,6 +22,7 @@ from ghostchat.crypto.signing import sign_message, verify_signature
 from ghostchat.media.decoder import MediaDecoder
 from ghostchat.media.encoder import MediaEncoder
 from ghostchat.network.discovery import DiscoveryService, Peer
+from ghostchat.network.gossip import GossipService
 from ghostchat.network.transport import TransportService
 from ghostchat.protocol.packets import MessagePacket
 from ghostchat.session.manager import SessionManager
@@ -64,6 +65,8 @@ class GhostChatApp:
             "peer_change": [],
             "message": [],
             "media": [],
+            "group_message": [],
+            "channel_change": [],
         }
 
         self.discovery = DiscoveryService(
@@ -81,6 +84,53 @@ class GhostChatApp:
             listen_port=self.port,
             on_message=self.on_message,
         )
+        self.gossip = GossipService(
+            local_peer_id=self.peer_id,
+            username=self.username,
+            sign_public_key_b64=self.keys.sign_public_b64,
+            sign_private=self.keys.sign_private,
+            transport=self.transport,
+            discovery=self.discovery,
+            on_group_message=self._on_group_message_received,
+            on_channel_change=self._on_channel_change,
+        )
+
+    def _on_group_message_received(self, packet: Any, decoded_text: str) -> None:
+        routing = self.session.record_incoming_group_message(
+            channel=packet.channel,
+            sender_username=packet.sender_username,
+            text=decoded_text,
+            timestamp=packet.timestamp,
+        )
+        for cb in self.ui_listeners.get("group_message", []):
+            try:
+                cb(packet.channel, packet.sender_username, decoded_text, routing)
+            except Exception:
+                pass
+
+    def _on_channel_change(self, channel: str, member_count: int) -> None:
+        for cb in self.ui_listeners.get("channel_change", []):
+            try:
+                cb(channel, member_count)
+            except Exception:
+                pass
+
+    def send_group_message(self, channel: str, text: str) -> None:
+        self.gossip.publish(channel, text)
+
+    def join_channel(self, channel: str, passphrase: Optional[str] = None) -> str:
+        canonical = self.session.join_channel(channel)
+        if passphrase:
+            self.gossip.set_channel_key(canonical, passphrase)
+        self.gossip.announce_channel(canonical, "JOIN")
+        return canonical
+
+    def leave_channel(self, channel: str) -> bool:
+        canonical = channel.lower()
+        if not canonical.startswith("#"):
+            canonical = f"#{canonical}"
+        self.gossip.announce_channel(canonical, "LEAVE")
+        return self.session.leave_channel(canonical)
 
     def register_ui_listener(self, event_type: str, callback: Callable) -> None:
         if event_type in self.ui_listeners:
@@ -96,6 +146,7 @@ class GhostChatApp:
     def start_services(self) -> None:
         self.discovery.start()
         self.transport.start()
+        self.gossip.announce_channel("#general", "JOIN")
 
     def stop_services(self) -> None:
         self.discovery.stop()
@@ -124,12 +175,12 @@ class GhostChatApp:
             self._handle_file_chunk(packet)
             return
 
-        if msg_type == "RETRANSMIT_REQUEST":
-            sender = packet.get("sender", "unknown")
-            with self.lock:
-                self.console.print(
-                    f"[yellow]INFO[/yellow] Received retransmit request from {sender} for {packet.get('message_id')}"
-                )
+        if msg_type == "GROUP_MESSAGE":
+            self.gossip.handle_group_packet(packet)
+            return
+
+        if msg_type == "CHANNEL_ANNOUNCE":
+            self.gossip.handle_channel_announce(packet)
             return
 
         if msg_type != "MESSAGE":
@@ -466,7 +517,10 @@ class GhostChatApp:
                 if line == "/help":
                     with self.lock:
                         self.console.print("[cyan]INFO[/cyan] /peers: show discovered peers")
-                        self.console.print("[cyan]INFO[/cyan] /msg <username> <text>: send encrypted message")
+                        self.console.print("[cyan]INFO[/cyan] /channels: show subscribed group channels")
+                        self.console.print("[cyan]INFO[/cyan] /join <#channel> [passkey]: join or create group channel")
+                        self.console.print("[cyan]INFO[/cyan] /leave <#channel>: leave group channel")
+                        self.console.print("[cyan]INFO[/cyan] /msg <target> <text>: send message (@user or #channel)")
                         self.console.print("[cyan]INFO[/cyan] /msg: interactive recipient picker")
                         self.console.print("[cyan]INFO[/cyan] /sendimg <target> <path>: send encrypted image")
                         self.console.print("[cyan]INFO[/cyan] /sendgif <target> <path>: send encrypted gif")
@@ -476,6 +530,38 @@ class GhostChatApp:
                         self.console.print("[cyan]INFO[/cyan] /chat pending: list pending chats")
                         self.console.print("[cyan]INFO[/cyan] /exit: close current chat thread")
                         self.console.print("[cyan]INFO[/cyan] /quit: exit GhostChat")
+                    continue
+
+                if line == "/channels":
+                    channels = self.session.joined_channels
+                    with self.lock:
+                        self.console.print(f"[cyan]INFO Subscribed channels ({len(channels)}):[/cyan]")
+                        for ch in channels:
+                            members = self.gossip.get_channel_members_count(ch)
+                            self.console.print(f"  • {ch} ({members} online)")
+                    continue
+
+                if line.startswith("/join "):
+                    parts = line.split(" ", 2)
+                    channel_name = parts[1].strip()
+                    passphrase = parts[2].strip() if len(parts) > 2 else None
+                    canonical = self.join_channel(channel_name, passphrase)
+                    with self.lock:
+                        self.console.print(f"[green]INFO[/green] Joined channel {canonical}")
+                    continue
+
+                if line.startswith("/leave "):
+                    target_ch = line.split(" ", 1)[1].strip()
+                    if target_ch == "#general":
+                        with self.lock:
+                            self.console.print("[yellow]WARN[/yellow] Cannot leave #general.")
+                        continue
+                    success = self.leave_channel(target_ch)
+                    with self.lock:
+                        if success:
+                            self.console.print(f"[cyan]INFO[/cyan] Left channel {target_ch}")
+                        else:
+                            self.console.print(f"[yellow]WARN[/yellow] Not in {target_ch}")
                     continue
 
                 if line == "/msg":
@@ -490,9 +576,15 @@ class GhostChatApp:
                     parts = line.split(" ", 2)
                     if len(parts) < 3:
                         with self.lock:
-                            self.console.print("[yellow]WARN[/yellow] Usage: /msg <username> <text>")
+                            self.console.print("[yellow]WARN[/yellow] Usage: /msg <target> <text>")
                         continue
                     target_token, text = parts[1], parts[2]
+                    if target_token.startswith("#"):
+                        self.send_group_message(target_token, text)
+                        with self.lock:
+                            self.console.print(f"[blue][To {target_token}][/blue]: {text}")
+                        continue
+
                     resolved = SessionManager.resolve_target(self.discovery.peers(), target_token)
                     if resolved is None:
                         with self.lock:

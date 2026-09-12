@@ -135,3 +135,84 @@ class AckPacket:
             sender_peer_id=str(data.get("sender_peer_id", "")),
             type=str(data.get("type", "ACK")),
         )
+
+
+def canonical_group_message_string(
+    channel: str,
+    message_id: str,
+    sender_peer_id: str,
+    timestamp: float,
+    content: str,
+) -> str:
+    """Deterministic string representation of group message for Ed25519 signing/verification."""
+    return f"{channel}:{message_id}:{sender_peer_id}:{timestamp:.3f}:{content}"
+
+
+@dataclass
+class GroupMessagePacket:
+    channel: str
+    message_id: str
+    sender_username: str
+    sender_peer_id: str
+    sender_sign_public_key: str
+    timestamp: float
+    content: str
+    is_encrypted: bool = False
+    ttl: int = 5
+    hop_count: int = 0
+    signature: str = ""
+    type: str = "GROUP_MESSAGE"
+
+    def canonical_data(self) -> str:
+        return canonical_group_message_string(
+            self.channel,
+            self.message_id,
+            self.sender_peer_id,
+            self.timestamp,
+            self.content,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "GroupMessagePacket":
+        return cls(
+            channel=str(data.get("channel", "#general")),
+            message_id=str(data.get("message_id", "")),
+            sender_username=str(data.get("sender_username", "unknown")),
+            sender_peer_id=str(data.get("sender_peer_id", "")),
+            sender_sign_public_key=str(data.get("sender_sign_public_key", "")),
+            timestamp=float(data.get("timestamp", 0.0)),
+            content=str(data.get("content", "")),
+            is_encrypted=bool(data.get("is_encrypted", False)),
+            ttl=int(data.get("ttl", 5)),
+            hop_count=int(data.get("hop_count", 0)),
+            signature=str(data.get("signature", "")),
+            type=str(data.get("type", "GROUP_MESSAGE")),
+        )
+
+
+@dataclass
+class ChannelAnnouncePacket:
+    channel: str
+    sender_username: str
+    sender_peer_id: str
+    action: str  # "JOIN" or "LEAVE"
+    timestamp: float
+    type: str = "CHANNEL_ANNOUNCE"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ChannelAnnouncePacket":
+        return cls(
+            channel=str(data.get("channel", "#general")),
+            sender_username=str(data.get("sender_username", "unknown")),
+            sender_peer_id=str(data.get("sender_peer_id", "")),
+            action=str(data.get("action", "JOIN")),
+            timestamp=float(data.get("timestamp", 0.0)),
+            type=str(data.get("type", "CHANNEL_ANNOUNCE")),
+        )
+
