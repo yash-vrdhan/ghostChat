@@ -1,11 +1,11 @@
 import threading
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from ghostchat.network.discovery import Peer
 
 
 class SessionManager:
-    """Manages active chat thread state, pending chats queue, and peer target resolution."""
+    """Manages active chat thread state, pending chats queue, channels, and peer target resolution."""
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -13,22 +13,121 @@ class SessionManager:
         # peer_id -> {"peer": Peer, "unread": int, "messages": List[str]}
         self._pending_chats: Dict[str, Dict[str, Any]] = {}
 
+        # Channels state
+        self._joined_channels: Set[str] = {"#general"}
+        self._active_channel: Optional[str] = None
+        self._channel_unread: Dict[str, int] = {}
+        self._channel_messages: Dict[str, List[Dict[str, Any]]] = {"#general": []}
+
     @property
     def chat_peer(self) -> Optional[Peer]:
         with self._lock:
             return self._chat_peer
 
+    @property
+    def active_channel(self) -> Optional[str]:
+        with self._lock:
+            return self._active_channel
+
+    @property
+    def joined_channels(self) -> List[str]:
+        with self._lock:
+            return sorted(self._joined_channels)
+
     def set_active_peer(self, peer: Optional[Peer]) -> Optional[Dict[str, Any]]:
         """Sets active chat peer and pops any pending unread messages."""
         with self._lock:
             self._chat_peer = peer
+            if peer:
+                self._active_channel = None
             if peer and peer.peer_id in self._pending_chats:
                 return self._pending_chats.pop(peer.peer_id)
             return None
 
+    def set_active_channel(self, channel: Optional[str]) -> None:
+        """Sets active channel and clears unread badge."""
+        with self._lock:
+            if channel:
+                channel = channel.lower()
+                if not channel.startswith("#"):
+                    channel = f"#{channel}"
+                self._joined_channels.add(channel)
+                self._chat_peer = None
+                self._active_channel = channel
+                self._channel_unread[channel] = 0
+            else:
+                self._active_channel = None
+
+    def join_channel(self, channel: str) -> str:
+        with self._lock:
+            channel = channel.lower()
+            if not channel.startswith("#"):
+                channel = f"#{channel}"
+            self._joined_channels.add(channel)
+            if channel not in self._channel_messages:
+                self._channel_messages[channel] = []
+            return channel
+
+    def leave_channel(self, channel: str) -> bool:
+        with self._lock:
+            channel = channel.lower()
+            if not channel.startswith("#"):
+                channel = f"#{channel}"
+            if channel in self._joined_channels and channel != "#general":
+                self._joined_channels.remove(channel)
+                if self._active_channel == channel:
+                    self._active_channel = None
+                return True
+            return False
+
+    def get_channel_unread(self, channel: str) -> int:
+        with self._lock:
+            return self._channel_unread.get(channel.lower(), 0)
+
+    def get_channel_messages(self, channel: str) -> List[Dict[str, Any]]:
+        with self._lock:
+            return list(self._channel_messages.get(channel.lower(), []))
+
+    def record_incoming_group_message(
+        self,
+        channel: str,
+        sender_username: str,
+        text: str,
+        timestamp: float,
+    ) -> Dict[str, Any]:
+        """Record an incoming group message into the channel history and update unread count."""
+        with self._lock:
+            channel = channel.lower()
+            if not channel.startswith("#"):
+                channel = f"#{channel}"
+
+            msg_entry = {
+                "channel": channel,
+                "sender": sender_username,
+                "text": text,
+                "timestamp": timestamp,
+            }
+
+            if channel not in self._channel_messages:
+                self._channel_messages[channel] = []
+            self._channel_messages[channel].append(msg_entry)
+
+            if self._active_channel == channel:
+                return {"action": "active", "channel": channel, "entry": msg_entry}
+
+            # If not currently viewing this channel, increment unread
+            self._channel_unread[channel] = self._channel_unread.get(channel, 0) + 1
+            return {
+                "action": "queued",
+                "channel": channel,
+                "unread": self._channel_unread[channel],
+                "entry": msg_entry,
+            }
+
     def close_active_thread(self) -> None:
         with self._lock:
             self._chat_peer = None
+            self._active_channel = None
 
     def get_pending_chats(self) -> List[Dict[str, Any]]:
         with self._lock:

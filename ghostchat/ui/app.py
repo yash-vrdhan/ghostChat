@@ -41,6 +41,20 @@ class PeerItem(ListItem):
         yield Label(f"{status_dot} @{self.peer.username} [dim]({self.peer.tcp_port})[/dim]{unread_badge}")
 
 
+class ChannelItem(ListItem):
+    """List item representing a group channel in the sidebar."""
+
+    def __init__(self, channel: str, member_count: int = 1, unread_count: int = 0) -> None:
+        super().__init__()
+        self.channel = channel
+        self.member_count = member_count
+        self.unread_count = unread_count
+
+    def compose(self) -> ComposeResult:
+        unread_badge = f" [bold yellow][{self.unread_count}][/bold yellow]" if self.unread_count > 0 else ""
+        yield Label(f"[bold magenta]{self.channel}[/bold magenta] [dim]({self.member_count})[/dim]{unread_badge}")
+
+
 class GhostChatTUIApp(App):
     """Full graphical Terminal User Interface for GhostChat."""
 
@@ -93,6 +107,24 @@ class GhostChatTUIApp(App):
         content-align: left middle;
         color: #89b4fa;
         text-style: bold;
+    }
+
+    .sidebar-section-title {
+        height: 1;
+        margin-top: 1;
+        color: #89b4fa;
+        text-style: bold;
+    }
+
+    #channel-list {
+        height: auto;
+        max-height: 5;
+        background: transparent;
+        border: none;
+    }
+
+    #channel-list:focus {
+        border: none;
     }
 
     #peer-list {
@@ -181,17 +213,20 @@ class GhostChatTUIApp(App):
         yield Header(show_clock=True)
         with Horizontal(id="main-container"):
             with Vertical(id="sidebar"):
-                yield Static(f"{MINI_LOGO}\n[dim]Peers on LAN[/dim]", id="sidebar-header")
+                yield Static(f"{MINI_LOGO}\n[dim]P2P Mesh[/dim]", id="sidebar-header")
+                yield Static("[bold magenta]CHANNELS[/bold magenta]", classes="sidebar-section-title")
+                yield ListView(id="channel-list")
+                yield Static("[bold cyan]PEERS ON LAN[/bold cyan]", classes="sidebar-section-title")
                 yield ListView(id="peer-list")
                 yield Static(
                     f"[dim]Node:[/dim] [cyan]@{self.backend.username}[/cyan]\n"
-                    f"[dim]Port:[/dim] [green]{self.backend.port}[/green] [dim]• TOFU Active[/dim]",
+                    f"[dim]Port:[/dim] [green]{self.backend.port}[/green] [dim]• Mesh Online[/dim]",
                     id="system-info",
                 )
 
             with Vertical(id="content-area"):
                 yield Static(
-                    "👻 GhostChat • No active thread (Select a peer on the left or type /help)",
+                    "👻 GhostChat • No active thread (Select a channel or peer or type /help)",
                     id="chat-header",
                 )
                 with Container(id="welcome-container"):
@@ -216,15 +251,51 @@ class GhostChatTUIApp(App):
         self.backend.register_ui_listener("peer_change", self._on_peer_change_callback)
         self.backend.register_ui_listener("message", self._on_message_callback)
         self.backend.register_ui_listener("media", self._on_media_callback)
+        self.backend.register_ui_listener("group_message", self._on_group_message_callback)
+        self.backend.register_ui_listener("channel_change", self._on_channel_change_callback)
 
         # Start backend services if not already started
         self.backend.start_services()
 
-        # Initial sidebar render and periodic refresh (every 2s)
+        # Initial sidebar render and periodic refresh
+        self.refresh_channels_sidebar()
         self.refresh_peer_sidebar()
         self.set_interval(2.0, self.refresh_peer_sidebar)
+        self.set_interval(3.0, self.refresh_channels_sidebar)
 
         self.query_one("#message-input", Input).focus()
+
+    def refresh_channels_sidebar(self) -> None:
+        channels = self.backend.session.joined_channels
+        channel_list = self.query_one("#channel-list", ListView)
+        channel_list.clear()
+
+        for ch in channels:
+            count = self.backend.gossip.get_channel_members_count(ch)
+            unread = self.backend.session.get_channel_unread(ch)
+            channel_list.append(ChannelItem(channel=ch, member_count=count, unread_count=unread))
+
+    def _on_channel_change_callback(self, channel: str, member_count: int) -> None:
+        self.call_from_thread(self.refresh_channels_sidebar)
+
+    def _on_group_message_callback(self, channel: str, sender: str, text: str, routing: dict) -> None:
+        def update_ui() -> None:
+            chat_log = self.query_one("#chat-log", RichLog)
+            timestamp = time.strftime("%H:%M:%S")
+
+            if routing.get("action") == "active":
+                if sender != self.backend.username:
+                    chat_log.write(
+                        f"[{timestamp}] [bold magenta][{channel} | @{sender}]:[/bold magenta] [white]{text}[/white]"
+                    )
+            else:
+                self.refresh_channels_sidebar()
+                if self.active_peer or self.backend.session.active_channel:
+                    chat_log.write(
+                        f"[dim][{timestamp}] [yellow]Notice:[/yellow] New message in [bold magenta]{channel}[/bold magenta] from @{sender}.[/dim]"
+                    )
+
+        self.call_from_thread(update_ui)
 
     def refresh_peer_sidebar(self) -> None:
         peers = self.backend.discovery.peers()
@@ -319,6 +390,46 @@ class GhostChatTUIApp(App):
 
         self.refresh_peer_sidebar()
 
+    def open_channel_thread(self, channel: str, quiet: bool = False) -> None:
+        self.active_peer = None
+        self.backend.session.set_active_channel(channel)
+
+        welcome_view = self.query_one("#welcome-container")
+        chat_log = self.query_one("#chat-log", RichLog)
+        chat_header = self.query_one("#chat-header", Static)
+        message_input = self.query_one("#message-input", Input)
+
+        welcome_view.styles.display = "none"
+        chat_log.styles.display = "block"
+        chat_log.clear()
+
+        member_count = self.backend.gossip.get_channel_members_count(channel)
+        chat_header.update(
+            f"📢 Channel [bold magenta]{channel}[/bold magenta] • "
+            f"[dim]{member_count} member(s) online • Gossip Mesh Active[/dim]"
+        )
+        message_input.placeholder = f"Message {channel}... (Press Esc to exit channel)"
+        message_input.focus()
+
+        if not quiet:
+            timestamp = time.strftime("%H:%M:%S")
+            chat_log.write(
+                f"[dim][{timestamp}] ── Connected to {channel} (Decentralized Mesh) ──[/dim]"
+            )
+
+        # Replay history
+        history = self.backend.session.get_channel_messages(channel)
+        for entry in history:
+            t = time.strftime("%H:%M:%S", time.localtime(entry.get("timestamp", time.time())))
+            sender = entry.get("sender", "unknown")
+            text = entry.get("text", "")
+            if sender == self.backend.username:
+                chat_log.write(f"[{t}] [bold blue][You]:[/bold blue] [white]{text}[/white]")
+            else:
+                chat_log.write(f"[{t}] [bold magenta][{channel} | @{sender}]:[/bold magenta] [white]{text}[/white]")
+
+        self.refresh_channels_sidebar()
+
     def action_close_thread(self) -> None:
         self.active_peer = None
         self.backend.session.close_active_thread()
@@ -330,10 +441,11 @@ class GhostChatTUIApp(App):
 
         chat_log.styles.display = "none"
         welcome_view.styles.display = "block"
-        chat_header.update("👻 GhostChat • No active thread (Select a peer on the left or type /help)")
+        chat_header.update("👻 GhostChat • No active thread (Select a channel or peer or type /help)")
         message_input.placeholder = "Type a message or /command... (Esc to unselect, /help for manual)"
         message_input.focus()
         self.refresh_peer_sidebar()
+        self.refresh_channels_sidebar()
 
     def action_focus_peers(self) -> None:
         self.query_one("#peer-list", ListView).focus()
@@ -343,7 +455,9 @@ class GhostChatTUIApp(App):
         chat_log.clear()
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
-        if isinstance(event.item, PeerItem):
+        if isinstance(event.item, ChannelItem):
+            self.open_channel_thread(event.item.channel)
+        elif isinstance(event.item, PeerItem):
             self.open_chat_thread(event.item.peer)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -362,7 +476,18 @@ class GhostChatTUIApp(App):
             self._handle_command(text, chat_log, timestamp)
             return
 
-        # Regular message in active chat thread
+        # Active channel thread (gossip broadcast)
+        if self.backend.session.active_channel:
+            channel = self.backend.session.active_channel
+            chat_log.write(f"[{timestamp}] [bold blue][You]:[/bold blue] [white]{text}[/white]")
+            threading.Thread(
+                target=self.backend.send_group_message,
+                args=(channel, text),
+                daemon=True,
+            ).start()
+            return
+
+        # Regular message in active 1-on-1 peer chat thread
         if self.active_peer is not None:
             peer = self.active_peer
             chat_log.write(f"[{timestamp}] [bold blue][You]:[/bold blue] [white]{text}[/white]")
@@ -374,8 +499,8 @@ class GhostChatTUIApp(App):
         else:
             self._show_chat_view_if_hidden()
             chat_log.write(
-                f"[yellow][{timestamp}] ⚠ No active chat thread. "
-                "Select a peer on the left or use '/msg <target> <text>'.[/yellow]"
+                f"[yellow][{timestamp}] ⚠ No active thread. "
+                "Select a channel (#general) or peer on the left, or use '/msg <target> <text>'.[/yellow]"
             )
 
     def _show_chat_view_if_hidden(self) -> None:
@@ -415,11 +540,51 @@ class GhostChatTUIApp(App):
                 chat_log.write(f"  {idx}. @{p.username} ({p.ip}:{p.tcp_port})")
             return
 
+        if cmd_line == "/channels":
+            channels = self.backend.session.joined_channels
+            chat_log.write(f"[{timestamp}] [cyan]INFO Subscribed channels ({len(channels)}):[/cyan]")
+            for ch in channels:
+                members = self.backend.gossip.get_channel_members_count(ch)
+                chat_log.write(f"  • [bold magenta]{ch}[/bold magenta] ({members} online)")
+            return
+
+        if cmd_line.startswith("/join "):
+            parts = cmd_line.split(" ", 2)
+            channel_name = parts[1].strip()
+            passphrase = parts[2].strip() if len(parts) > 2 else None
+            canonical = self.backend.join_channel(channel_name, passphrase)
+            self.open_channel_thread(canonical)
+            chat_log.write(
+                f"[{timestamp}] [green]Joined channel {canonical}.[/green]"
+                + (" [dim](Keyed encryption active)[/dim]" if passphrase else "")
+            )
+            return
+
+        if cmd_line.startswith("/leave"):
+            parts = cmd_line.split(" ", 1)
+            target_ch = parts[1].strip() if len(parts) > 1 else self.backend.session.active_channel
+            if not target_ch:
+                chat_log.write("[yellow]Usage: /leave <#channel> (or /leave in active channel)[/yellow]")
+                return
+            if target_ch == "#general":
+                chat_log.write("[yellow]Cannot leave default channel #general.[/yellow]")
+                return
+            success = self.backend.leave_channel(target_ch)
+            if success:
+                self.action_close_thread()
+                chat_log.write(f"[{timestamp}] [cyan]Left channel {target_ch}.[/cyan]")
+            else:
+                chat_log.write(f"[yellow]Not subscribed to {target_ch}.[/yellow]")
+            return
+
         if cmd_line == "/help":
             chat_log.write(f"[bold cyan]── GhostChat Command Manual ──[/bold cyan]")
-            chat_log.write("  • [cyan]/peers[/cyan] : Show discovered peers")
-            chat_log.write("  • [cyan]/msg <target> <text>[/cyan] : Send one-off encrypted message")
-            chat_log.write("  • [cyan]/chat <target>[/cyan] : Open dedicated thread with target")
+            chat_log.write("  • [cyan]/channels[/cyan] : List subscribed group channels")
+            chat_log.write("  • [cyan]/join <#channel> [passkey][/cyan] : Join or create a group channel")
+            chat_log.write("  • [cyan]/leave <#channel>[/cyan] : Leave a group channel")
+            chat_log.write("  • [cyan]/peers[/cyan] : Show discovered LAN peers")
+            chat_log.write("  • [cyan]/msg <target> <text>[/cyan] : Send message (target can be @user or #channel)")
+            chat_log.write("  • [cyan]/chat <target>[/cyan] : Open dedicated thread with peer")
             chat_log.write("  • [cyan]/sendimg <target> <path>[/cyan] : Send encrypted image")
             chat_log.write("  • [cyan]/sendgif <target> <path>[/cyan] : Send encrypted animated GIF")
             chat_log.write("  • [cyan]/exit[/cyan] : Close current chat thread and return to dashboard")
@@ -432,6 +597,15 @@ class GhostChatTUIApp(App):
                 chat_log.write("[yellow]Usage: /msg <target> <text>[/yellow]")
                 return
             target_token, msg_text = parts[1], parts[2]
+
+            # Channel message routing
+            if target_token.startswith("#"):
+                self.backend.send_group_message(target_token, msg_text)
+                chat_log.write(
+                    f"[{timestamp}] [bold blue][To {target_token}]:[/bold blue] [white]{msg_text}[/white]"
+                )
+                return
+
             resolved = SessionManager.resolve_target(self.backend.discovery.peers(), target_token)
             if resolved is None:
                 chat_log.write(f"[yellow]Peer '{target_token}' not found.[/yellow]")
@@ -445,6 +619,9 @@ class GhostChatTUIApp(App):
 
         if cmd_line.startswith("/chat "):
             target_token = cmd_line.split(" ", 1)[1].strip()
+            if target_token.startswith("#"):
+                self.open_channel_thread(target_token)
+                return
             resolved = SessionManager.resolve_target(self.backend.discovery.peers(), target_token)
             if resolved is None:
                 chat_log.write(f"[yellow]Peer '{target_token}' not found.[/yellow]")

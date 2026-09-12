@@ -325,13 +325,48 @@ In Textual's internal event loop:
 
 ---
 
-## 6. Next Frontiers: Beyond Phase 2
+---
 
-With the foundations hardened and the graphical TUI running smoothly, GhostChat is primed for its next major milestones:
+## 6. Phase 3: Decentralized Multi-Party Group Channels (Epidemic Gossip Mesh)
+
+### What Was Built
+Decentralized multi-party channels (e.g. `#general`, `#dev-mesh`) operating entirely peer-to-peer without central IRC servers, Matrix homeservers, or relay bots:
+1. **Epidemic Gossip Protocol (`ghostchat/network/gossip.py`)**:
+   - `GroupMessagePacket` with hop count, decrementing TTL (default: 5), and origin timestamp.
+   - Originator Ed25519 digital signature over canonical tuple `f"{channel}:{message_id}:{sender_peer_id}:{timestamp}:{content}"`.
+   - Thread-safe bounded LRU `SeenMessageCache` (5,000 entries) preventing duplicate processing and network broadcast storms.
+2. **Channel Key Derivation & Authenticated SecretBox**:
+   - For private channels (`/join #secret-ops <passphrase>`), a 256-bit symmetric key is derived via `PBKDF2-HMAC-SHA256` salted with the channel name.
+   - Messages are encrypted with PyNaCl `SecretBox` (XSalsa20 + Poly1305 MAC).
+   - Non-member nodes in the gossip mesh can safely relay the ciphertext across hops without reading plaintext or forging content.
+3. **Channel Presence & Announce Mesh**:
+   - `ChannelAnnouncePacket` (`JOIN` / `LEAVE`) gossiped across the network to track dynamic membership counts per channel.
+4. **TUI & CLI Integration**:
+   - Sidebar displays dedicated `CHANNELS` section above `PEERS ON LAN`.
+   - Seamless thread switching: click any channel to open the multi-party room.
+   - Rich log renders messages with channel badges and author handles: `[18:00:22] [#general | @bob]: Message`.
+   - Commands: `/join <#channel> [passkey]`, `/leave <#channel>`, `/channels`, `/msg <#channel> <text>`.
+
+### Critical Systems & Distributed Protocol Lessons Learned
+
+#### 1. The Broadcast Storm Dilemma in Decentralized Networks
+In a decentralized mesh, naive flooding—where every node forwards incoming messages to all connected neighbors—causes an exponential explosion of duplicate packets ($O(2^h)$), saturating network bandwidth and CPU.
+- *The Solution*: Combining a bounded, thread-safe **LRU Seen Cache** with a strict **Time-To-Live (TTL)** counter. When an incoming `message_id` has already been marked as seen, it is dropped in $O(1)$ time without relaying. When `ttl <= 1`, forwarding stops immediately.
+
+#### 2. End-to-End Integrity Across Multi-Hop Relays
+In direct 1-to-1 TCP, you can verify the immediate socket connection. In a gossip mesh, Alice's message might reach Charlie through Bob. If Bob were malicious, he could attempt to tamper with Alice's text before forwarding.
+- *The Solution*: Cryptographic origin authentication. The originator signs the message with Ed25519. Any node along the relay path—and the ultimate recipient—verifies the signature against Alice's public key. If Bob alters a single byte, signature verification fails and the packet is immediately dropped.
+
+---
+
+## 7. Next Frontiers: Beyond Phase 3
+
+With decentralized group channels and gossip routing established, GhostChat is positioned for its next evolutions:
 
 1. **Forward Secrecy (The Double Ratchet Algorithm)**:
-   - Currently, if a user's static private key is compromised, all past intercepted ciphertexts can be decrypted. Upgrading to the Signal Double Ratchet algorithm will rotate ephemeral keys per message, ensuring past communications remain secure even if future keys are leaked.
+   - Implement ephemeral X25519 key exchange per thread and ratchet-derived symmetric keys to guarantee Perfect Forward Secrecy for 1-on-1 threads.
 2. **Encrypted File & Code Snippet Transfer**:
-   - Stream files in encrypted 32 KB chunks with SHA-256 integrity verification and Rich terminal progress bars.
-3. **Decentralized AI Agent Fabric**:
-   - Turn GhostChat into an autonomous agent communication network, allowing local LLM agents to securely discover peers, negotiate tasks, and collaborate peer-to-peer using standard JSON-RPC / MCP framing.
+   - Generalize the media pipeline to arbitrary files with chunked transfers and syntax-highlighted code blocks.
+3. **Autonomous AI Agent Fabric (MCP / Agent Mesh)**:
+   - Provide an autonomous inter-agent RPC layer allowing local AI coding assistants (Claude Code, Gemini CLI, Ollama) on the LAN to negotiate tasks, invoke tools, and collaborate over GhostChat's encrypted gossip channels.
+

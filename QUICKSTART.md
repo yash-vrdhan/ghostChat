@@ -119,27 +119,50 @@ Or send directly from the dashboard:
 
 ---
 
-## ⌨️ Step 6: Navigation & Keyboard Shortcuts
+## 📢 Step 6: Multi-Party Group Channels (Decentralized Gossip Mesh)
 
-| Key / Command | Action | Description |
-| :--- | :--- | :--- |
-| `Esc` | **Exit Thread** | Unselects the active peer and returns to the Welcome Dashboard |
-| `Tab` | **Focus Peers** | Moves focus between the message input box and the sidebar |
-| `Ctrl + Q` | **Quit** | Gracefully disconnects sockets and closes GhostChat |
-| `Ctrl + L` | **Clear Feed** | Clears the message log in the current view |
-| `Enter` | **Send / Select** | Sends typed message or opens selected peer in sidebar |
+In addition to 1-on-1 private threads, GhostChat features decentralized group channels (e.g. `#general`, `#dev-team`) operating over an **Epidemic Gossip Protocol** with zero central servers.
+
+To join a channel:
+1. Click **`#general`** in the left sidebar `CHANNELS` section, or
+2. Type `/join #general` or `/join #my-channel [passphrase]`.
+
+<p align="center">
+  <img src="docs/assets/05_group_channel.png" alt="Multi-Party Group Channel" width="850">
+</p>
+
+### How the Gossip Mesh Works:
+- **Zero Central Server**: Messages hop from peer to peer across the network.
+- **Flooding Control**: A bounded LRU Seen Cache suppresses duplicate packets in $O(1)$ time, eliminating broadcast storms.
+- **Ed25519 Origin Authentication**: Every group message is signed by the originator; intermediate relay nodes cannot tamper with or forge messages.
+- **Keyed Channels**: For private channels (`/join #secret <key>`), messages are encrypted with authenticated `SecretBox` (XSalsa20-Poly1305). Only members with the passphrase can decrypt, while non-members can relay the ciphertext across the mesh.
 
 ---
 
-## 📜 Step 7: Slash Commands Reference
+## ⌨️ Step 7: Navigation & Keyboard Shortcuts
+
+| Key / Command | Action | Description |
+| :--- | :--- | :--- |
+| `Esc` | **Exit Thread** | Unselects the active peer or channel and returns to Dashboard |
+| `Tab` | **Focus Sidebar** | Moves focus between the message input box and the sidebar |
+| `Ctrl + Q` | **Quit** | Gracefully disconnects sockets and closes GhostChat |
+| `Ctrl + L` | **Clear Feed** | Clears the message log in the current view |
+| `Enter` | **Send / Select** | Sends typed message or opens selected peer/channel |
+
+---
+
+## 📜 Step 8: Slash Commands Reference
 
 Type these commands directly into the bottom input bar:
 
 | Command | Syntax | Description |
 | :--- | :--- | :--- |
+| `/channels` | `/channels` | Lists all joined group channels and member counts |
+| `/join` | `/join <#channel> [passkey]` | Joins or creates a group channel (optional encryption) |
+| `/leave` | `/leave <#channel>` | Leaves a group channel |
 | `/peers` | `/peers` | Displays a list of all currently discovered LAN peers |
-| `/chat` | `/chat <target>` | Opens a thread with target (`username`, `user@port`, or `ip:port`) |
-| `/msg` | `/msg <target> <text>` | Sends a one-off encrypted message without opening a thread |
+| `/chat` | `/chat <target>` | Opens a thread with target (`username`, `user@port`, or `#channel`) |
+| `/msg` | `/msg <target> <text>` | Sends message directly to a peer or `#channel` |
 | `/sendimg` | `/sendimg <target> <file>` | Sends an encrypted image rendered as ASCII |
 | `/sendgif` | `/sendgif <target> <file>` | Sends an encrypted animated GIF rendered as ASCII |
 | `/exit` | `/exit` or `/close` | Closes the current thread and returns to the dashboard |
